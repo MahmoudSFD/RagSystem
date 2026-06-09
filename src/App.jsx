@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { Send, ThumbsUp, ThumbsDown, FileText } from 'lucide-react'
+
 const FEEDBACK_API_URL = 'http://127.0.0.1:8000/api/feedback'
+const CHAT_API_URL = 'http://127.0.0.1:8000/api/chat'
 
 const initialMessages = [
   {
@@ -23,9 +25,9 @@ const initialMessages = [
       'The CIS Controls are a set of defensive actions led by the Center for Internet Security. They help organizations focus on important steps to defend against common real-world cyberattacks.',
     sources: [
       {
-        source: 'CIS Controls v8 PDF',
+        title: 'CIS Controls v8 PDF',
         page: 11,
-        chunk: 0,
+        snippet: 'Example source from the CIS Controls document.',
       },
     ],
     question: 'What are the CIS Controls?',
@@ -39,43 +41,57 @@ function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
 
-  function handleSendMessage() {
-    const cleanInput = input.trim()
+  async function handleSendMessage() {
+    if (!input.trim()) return
 
-    if (!cleanInput) return
+    const currentInput = input
 
     const userMessage = {
       id: Date.now(),
       role: 'user',
-      content: cleanInput,
+      content: currentInput,
       sources: [],
     }
 
-    setMessages((currentMessages) => [...currentMessages, userMessage])
+    setMessages((prev) => [...prev, userMessage])
     setInput('')
     setIsLoading(true)
     setErrorMessage('')
 
-    setTimeout(() => {
+    try {
+      const response = await fetch(CHAT_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          question: currentInput,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to get answer from backend')
+      }
+
+      const data = await response.json()
+
       const assistantMessage = {
         id: Date.now() + 1,
         role: 'assistant',
-        content:
-          'This is a temporary assistant response. Later, this will come from the RAG backend with real retrieved sources.',
-        sources: [
-          {
-            source: 'CIS Controls v8 PDF',
-            page: 11,
-            chunk: 0,
-          },
-        ],
-        question: cleanInput,
+        content: data.answer,
+        sources: data.sources || [],
+        run_id: data.run_id,
+        question: currentInput,
         feedbackStatus: null,
       }
 
-      setMessages((currentMessages) => [...currentMessages, assistantMessage])
+      setMessages((prev) => [...prev, assistantMessage])
+    } catch (error) {
+      console.error(error)
+      setErrorMessage('Could not connect to the backend.')
+    } finally {
       setIsLoading(false)
-    }, 800)
+    }
   }
 
   function handleKeyDown(event) {
@@ -101,7 +117,7 @@ function App() {
             feedbackType === 'thumbs_up'
               ? 'User marked the answer as helpful.'
               : 'User marked the answer as needing work.',
-          run_id: null,
+          run_id: message.run_id || null,
         }),
       })
 
@@ -180,19 +196,24 @@ function App() {
 
                     <p className="mt-2 leading-relaxed">{message.content}</p>
 
-                    {!isUser && message.sources.length > 0 && (
+                    {!isUser && message.sources && message.sources.length > 0 && (
                       <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/70 p-3">
                         <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-  <FileText size={14} />
-  Sources
-</p>
+                          <FileText size={14} />
+                          Sources
+                        </p>
 
-                        <div className="mt-2 space-y-1">
+                        <div className="mt-2 space-y-2">
                           {message.sources.map((source, index) => (
-                            <p key={index} className="text-sm text-slate-300">
-                              {source.source} · Page {source.page} · Chunk{' '}
-                              {source.chunk}
-                            </p>
+                            <div key={index} className="text-sm text-slate-300">
+                              <p className="font-medium text-slate-200">
+                                {source.title}
+                                {source.page ? ` · Page ${source.page}` : ''}
+                              </p>
+                              <p className="text-slate-400">
+                                {source.snippet}
+                              </p>
+                            </div>
                           ))}
                         </div>
                       </div>
@@ -200,29 +221,29 @@ function App() {
 
                     {!isUser && (
                       <div className="mt-4 flex items-center gap-2">
-                       <button
-  onClick={() => sendFeedback(message, 'thumbs_up')}
-  className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
-    message.feedbackStatus === 'thumbs_up'
-      ? 'border-emerald-400 bg-emerald-400/20 text-emerald-200'
-      : 'border-white/10 text-slate-300 hover:bg-white/10'
-  }`}
->
-  <ThumbsUp size={15} />
-  Helpful
-</button>
+                        <button
+                          onClick={() => sendFeedback(message, 'thumbs_up')}
+                          className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
+                            message.feedbackStatus === 'thumbs_up'
+                              ? 'border-emerald-400 bg-emerald-400/20 text-emerald-200'
+                              : 'border-white/10 text-slate-300 hover:bg-white/10'
+                          }`}
+                        >
+                          <ThumbsUp size={15} />
+                          Helpful
+                        </button>
 
-                       <button
-  onClick={() => sendFeedback(message, 'thumbs_down')}
-  className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
-    message.feedbackStatus === 'thumbs_down'
-      ? 'border-red-400 bg-red-400/20 text-red-200'
-      : 'border-white/10 text-slate-300 hover:bg-white/10'
-  }`}
->
-  <ThumbsDown size={15} />
-  Needs work
-</button>
+                        <button
+                          onClick={() => sendFeedback(message, 'thumbs_down')}
+                          className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
+                            message.feedbackStatus === 'thumbs_down'
+                              ? 'border-red-400 bg-red-400/20 text-red-200'
+                              : 'border-white/10 text-slate-300 hover:bg-white/10'
+                          }`}
+                        >
+                          <ThumbsDown size={15} />
+                          Needs work
+                        </button>
 
                         {message.feedbackStatus && (
                           <span className="ml-2 text-xs text-slate-400">
@@ -257,14 +278,15 @@ function App() {
                 className="flex-1 rounded-xl border border-white/10 bg-slate-900 px-4 py-3 text-slate-100 outline-none placeholder:text-slate-500 focus:border-emerald-400"
                 placeholder="Ask a question about the document..."
               />
+
               <button
-  onClick={handleSendMessage}
-  disabled={isLoading}
-  className="flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-3 font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
->
-  <Send size={18} />
-  Send
-</button>
+                onClick={handleSendMessage}
+                disabled={isLoading}
+                className="flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-3 font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Send size={18} />
+                Send
+              </button>
             </div>
           </footer>
         </main>
