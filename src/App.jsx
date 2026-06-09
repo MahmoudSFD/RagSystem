@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Send, ThumbsUp, ThumbsDown, FileText } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
 
 const FEEDBACK_API_URL = 'http://127.0.0.1:8000/api/feedback'
 const CHAT_API_URL = 'http://127.0.0.1:8000/api/chat'
@@ -194,8 +195,43 @@ function App() {
                       {isUser ? 'You' : 'Assistant'}
                     </p>
 
-                    <p className="mt-2 leading-relaxed">{message.content}</p>
-
+<div
+  className={`mt-2 leading-relaxed ${
+    isUser ? 'text-slate-950' : 'text-slate-100'
+  }`}
+>
+  {isUser ? (
+    <p>{message.content}</p>
+  ) : (
+    <ReactMarkdown
+      components={{
+        p: ({ children }) => <p className="mb-2">{children}</p>,
+        strong: ({ children }) => (
+          <strong className="font-bold text-white">{children}</strong>
+        ),
+        ul: ({ children }) => (
+          <ul className="mb-2 ml-5 list-disc space-y-1">{children}</ul>
+        ),
+        ol: ({ children }) => (
+          <ol className="mb-2 ml-5 list-decimal space-y-1">{children}</ol>
+        ),
+        li: ({ children }) => <li>{children}</li>,
+        code: ({ children }) => (
+          <code className="rounded bg-slate-950 px-1 py-0.5 text-sm text-emerald-300">
+            {children}
+          </code>
+        ),
+        pre: ({ children }) => (
+          <pre className="my-3 overflow-x-auto rounded-xl bg-slate-950 p-3 text-sm">
+            {children}
+          </pre>
+        ),
+      }}
+    >
+      {message.content}
+    </ReactMarkdown>
+  )}
+</div>
                     {!isUser && message.sources && message.sources.length > 0 && (
                       <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/70 p-3">
                         <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
