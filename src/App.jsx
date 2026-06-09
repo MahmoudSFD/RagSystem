@@ -3,7 +3,7 @@ import { Send, ThumbsUp, ThumbsDown, FileText } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 
 const FEEDBACK_API_URL = 'http://127.0.0.1:8000/api/feedback'
-const CHAT_API_URL = 'http://127.0.0.1:8000/api/chat'
+const CHAT_STREAM_API_URL = 'http://127.0.0.1:8000/api/chat/stream'
 
 const initialMessages = [
   {
@@ -12,6 +12,7 @@ const initialMessages = [
     content:
       'Hello! I can help answer questions using the knowledge base and show the sources used for each response.',
     sources: [],
+    feedbackStatus: null,
   },
   {
     id: 2,
@@ -23,7 +24,7 @@ const initialMessages = [
     id: 3,
     role: 'assistant',
     content:
-      'The CIS Controls are a set of defensive actions led by the Center for Internet Security. They help organizations focus on important steps to defend against common real-world cyberattacks.',
+      '**The CIS Controls** are a set of defensive actions led by the Center for Internet Security. They help organizations focus on important steps to defend against common real-world cyberattacks.',
     sources: [
       {
         title: 'CIS Controls v8 PDF',
@@ -33,6 +34,7 @@ const initialMessages = [
     ],
     question: 'What are the CIS Controls?',
     feedbackStatus: null,
+    run_id: null,
   },
 ]
 
@@ -43,24 +45,36 @@ function App() {
   const [errorMessage, setErrorMessage] = useState('')
 
   async function handleSendMessage() {
-    if (!input.trim()) return
+    if (!input.trim() || isLoading) return
 
     const currentInput = input
+    const userMessageId = Date.now()
+    const assistantMessageId = userMessageId + 1
 
     const userMessage = {
-      id: Date.now(),
+      id: userMessageId,
       role: 'user',
       content: currentInput,
       sources: [],
     }
 
-    setMessages((prev) => [...prev, userMessage])
+    const assistantMessage = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      sources: [],
+      run_id: null,
+      question: currentInput,
+      feedbackStatus: null,
+    }
+
+    setMessages((prev) => [...prev, userMessage, assistantMessage])
     setInput('')
     setIsLoading(true)
     setErrorMessage('')
 
     try {
-      const response = await fetch(CHAT_API_URL, {
+      const response = await fetch(CHAT_STREAM_API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -70,33 +84,87 @@ function App() {
         }),
       })
 
-      if (!response.ok) {
-        throw new Error('Failed to get answer from backend')
+      if (!response.ok || !response.body) {
+        throw new Error('Failed to stream answer from backend')
       }
 
-      const data = await response.json()
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
 
-      const assistantMessage = {
-        id: Date.now() + 1,
-        role: 'assistant',
-        content: data.answer,
-        sources: data.sources || [],
-        run_id: data.run_id,
-        question: currentInput,
-        feedbackStatus: null,
+      while (true) {
+        const { value, done } = await reader.read()
+
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+
+        const events = buffer.split('\n\n')
+        buffer = events.pop() || ''
+
+        for (const event of events) {
+          if (!event.startsWith('data: ')) continue
+
+          const jsonString = event.replace('data: ', '')
+          const data = JSON.parse(jsonString)
+
+          if (data.type === 'token') {
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === assistantMessageId
+                  ? {
+                      ...message,
+                      content: message.content + data.content,
+                    }
+                  : message,
+              ),
+            )
+          }
+
+          if (data.type === 'sources') {
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === assistantMessageId
+                  ? {
+                      ...message,
+                      sources: data.sources || [],
+                      run_id: data.run_id || null,
+                    }
+                  : message,
+              ),
+            )
+          }
+
+          if (data.type === 'done') {
+            setIsLoading(false)
+          }
+        }
       }
-
-      setMessages((prev) => [...prev, assistantMessage])
     } catch (error) {
       console.error(error)
-      setErrorMessage('Could not connect to the backend.')
+      setErrorMessage(
+        'Could not stream the answer from the backend. Make sure FastAPI is running.',
+      )
+
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === assistantMessageId
+            ? {
+                ...message,
+                content:
+                  'Sorry, I could not connect to the backend streaming endpoint.',
+              }
+            : message,
+        ),
+      )
     } finally {
       setIsLoading(false)
     }
   }
 
   function handleKeyDown(event) {
-    if (event.key === 'Enter') {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault()
       handleSendMessage()
     }
   }
@@ -195,43 +263,54 @@ function App() {
                       {isUser ? 'You' : 'Assistant'}
                     </p>
 
-<div
-  className={`mt-2 leading-relaxed ${
-    isUser ? 'text-slate-950' : 'text-slate-100'
-  }`}
->
-  {isUser ? (
-    <p>{message.content}</p>
-  ) : (
-    <ReactMarkdown
-      components={{
-        p: ({ children }) => <p className="mb-2">{children}</p>,
-        strong: ({ children }) => (
-          <strong className="font-bold text-white">{children}</strong>
-        ),
-        ul: ({ children }) => (
-          <ul className="mb-2 ml-5 list-disc space-y-1">{children}</ul>
-        ),
-        ol: ({ children }) => (
-          <ol className="mb-2 ml-5 list-decimal space-y-1">{children}</ol>
-        ),
-        li: ({ children }) => <li>{children}</li>,
-        code: ({ children }) => (
-          <code className="rounded bg-slate-950 px-1 py-0.5 text-sm text-emerald-300">
-            {children}
-          </code>
-        ),
-        pre: ({ children }) => (
-          <pre className="my-3 overflow-x-auto rounded-xl bg-slate-950 p-3 text-sm">
-            {children}
-          </pre>
-        ),
-      }}
-    >
-      {message.content}
-    </ReactMarkdown>
-  )}
-</div>
+                    <div
+                      className={`mt-2 leading-relaxed ${
+                        isUser ? 'text-slate-950' : 'text-slate-100'
+                      }`}
+                    >
+                      {isUser ? (
+                        <p>{message.content}</p>
+                      ) : message.content ? (
+                        <ReactMarkdown
+                          components={{
+                            p: ({ children }) => (
+                              <p className="mb-2">{children}</p>
+                            ),
+                            strong: ({ children }) => (
+                              <strong className="font-bold text-white">
+                                {children}
+                              </strong>
+                            ),
+                            ul: ({ children }) => (
+                              <ul className="mb-2 ml-5 list-disc space-y-1">
+                                {children}
+                              </ul>
+                            ),
+                            ol: ({ children }) => (
+                              <ol className="mb-2 ml-5 list-decimal space-y-1">
+                                {children}
+                              </ol>
+                            ),
+                            li: ({ children }) => <li>{children}</li>,
+                            code: ({ children }) => (
+                              <code className="rounded bg-slate-950 px-1 py-0.5 text-sm text-emerald-300">
+                                {children}
+                              </code>
+                            ),
+                            pre: ({ children }) => (
+                              <pre className="my-3 overflow-x-auto rounded-xl bg-slate-950 p-3 text-sm">
+                                {children}
+                              </pre>
+                            ),
+                          }}
+                        >
+                          {message.content}
+                        </ReactMarkdown>
+                      ) : (
+                        <p className="text-slate-400">Starting response...</p>
+                      )}
+                    </div>
+
                     {!isUser && message.sources && message.sources.length > 0 && (
                       <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/70 p-3">
                         <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
@@ -259,11 +338,12 @@ function App() {
                       <div className="mt-4 flex items-center gap-2">
                         <button
                           onClick={() => sendFeedback(message, 'thumbs_up')}
+                          disabled={isLoading && !message.content}
                           className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
                             message.feedbackStatus === 'thumbs_up'
                               ? 'border-emerald-400 bg-emerald-400/20 text-emerald-200'
                               : 'border-white/10 text-slate-300 hover:bg-white/10'
-                          }`}
+                          } disabled:cursor-not-allowed disabled:opacity-50`}
                         >
                           <ThumbsUp size={15} />
                           Helpful
@@ -271,11 +351,12 @@ function App() {
 
                         <button
                           onClick={() => sendFeedback(message, 'thumbs_down')}
+                          disabled={isLoading && !message.content}
                           className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
                             message.feedbackStatus === 'thumbs_down'
                               ? 'border-red-400 bg-red-400/20 text-red-200'
                               : 'border-white/10 text-slate-300 hover:bg-white/10'
-                          }`}
+                          } disabled:cursor-not-allowed disabled:opacity-50`}
                         >
                           <ThumbsDown size={15} />
                           Needs work
@@ -294,14 +375,7 @@ function App() {
             })}
 
             {isLoading && (
-              <div className="flex justify-start">
-                <div className="rounded-2xl rounded-tl-sm bg-slate-800 px-5 py-4 shadow">
-                  <p className="text-sm font-semibold text-emerald-400">
-                    Assistant
-                  </p>
-                  <p className="mt-2 text-slate-300">Thinking...</p>
-                </div>
-              </div>
+              <p className="text-sm text-slate-400">Assistant is typing...</p>
             )}
           </section>
 
@@ -311,13 +385,14 @@ function App() {
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={handleKeyDown}
-                className="flex-1 rounded-xl border border-white/10 bg-slate-900 px-4 py-3 text-slate-100 outline-none placeholder:text-slate-500 focus:border-emerald-400"
+                disabled={isLoading}
+                className="flex-1 rounded-xl border border-white/10 bg-slate-900 px-4 py-3 text-slate-100 outline-none placeholder:text-slate-500 focus:border-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
                 placeholder="Ask a question about the document..."
               />
 
               <button
                 onClick={handleSendMessage}
-                disabled={isLoading}
+                disabled={isLoading || !input.trim()}
                 className="flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-3 font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 <Send size={18} />
