@@ -1,5 +1,13 @@
 import { useState } from 'react'
-import { Send, ThumbsUp, ThumbsDown, FileText } from 'lucide-react'
+import {
+  Send,
+  ThumbsUp,
+  ThumbsDown,
+  FileText,
+  ChevronDown,
+  ChevronRight,
+}  from 'lucide-react'
+
 import ReactMarkdown from 'react-markdown'
 
 const FEEDBACK_API_URL = 'http://127.0.0.1:8000/api/feedback'
@@ -43,6 +51,7 @@ function App() {
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
+  const [openSources, setOpenSources] = useState({})
 
   async function handleSendMessage() {
     if (!input.trim() || isLoading) return
@@ -168,7 +177,14 @@ function App() {
       handleSendMessage()
     }
   }
+function toggleSource(messageId, sourceIndex) {
+  const key = `${messageId}-${sourceIndex}`
 
+  setOpenSources((prev) => ({
+    ...prev,
+    [key]: !prev[key],
+  }))
+}
   async function sendFeedback(message, feedbackType) {
     setErrorMessage('')
 
@@ -312,28 +328,55 @@ function App() {
                     </div>
 
                     {!isUser && message.sources && message.sources.length > 0 && (
-                      <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/70 p-3">
-                        <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                          <FileText size={14} />
-                          Sources
-                        </p>
+  <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/70 p-3">
+    <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+      <FileText size={14} />
+      Sources
+    </p>
 
-                        <div className="mt-2 space-y-2">
-                          {message.sources.map((source, index) => (
-                            <div key={index} className="text-sm text-slate-300">
-                              <p className="font-medium text-slate-200">
-                                {source.title}
-                                {source.page ? ` · Page ${source.page}` : ''}
-                              </p>
-                              <p className="text-slate-400">
-                                {source.snippet}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
+    <div className="mt-3 space-y-2">
+      {message.sources.map((source, index) => {
+        const sourceKey = `${message.id}-${index}`
+        const isOpen = openSources[sourceKey]
 
+        return (
+          <div
+            key={sourceKey}
+            className="rounded-lg border border-white/10 bg-slate-950/50"
+          >
+            <button
+              type="button"
+              onClick={() => toggleSource(message.id, index)}
+              className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
+            >
+              <span className="font-medium">
+                {source.title}
+                {source.page ? ` · Page ${source.page}` : ''}
+              </span>
+
+              {isOpen ? (
+                <ChevronDown size={16} className="text-slate-400" />
+              ) : (
+                <ChevronRight size={16} className="text-slate-400" />
+              )}
+            </button>
+
+            {isOpen && (
+              <div className="border-t border-white/10 px-3 py-2 text-sm text-slate-400">
+                <p>{source.snippet}</p>
+
+                <div className="mt-2 text-xs text-slate-500">
+                  <p>Document: {source.title}</p>
+                  <p>Page: {source.page || 'Not available'}</p>
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  </div>
+)}
                     {!isUser && (
                       <div className="mt-4 flex items-center gap-2">
                         <button
