@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+backend/.venv/
+
+backend/__pycache__/
+
+backend/*.pyc
+
+backend/.env
+backend/feedback_logs.jsonl
