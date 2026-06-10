@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Send,
   ThumbsUp,
@@ -11,13 +11,23 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Trash2,
+  BarChart3,
+  RotateCcw,
+  Pencil,
+  X,
+  Check,
+  AlertTriangle,
+  Loader2,
 } from 'lucide-react'
 
 import ReactMarkdown from 'react-markdown'
 
 const FEEDBACK_API_URL = 'http://127.0.0.1:8000/api/feedback'
+const FEEDBACK_SUMMARY_API_URL = 'http://127.0.0.1:8000/api/feedback/summary'
 const CHAT_STREAM_API_URL = 'http://127.0.0.1:8000/api/chat/stream'
 const CONVERSATIONS_API_URL = 'http://127.0.0.1:8000/api/conversations'
+
+const TITLE_OVERRIDES_KEY = 'ragConversationTitleOverrides'
 
 const welcomeMessage = {
   id: 1,
@@ -26,17 +36,38 @@ const welcomeMessage = {
     'Hello! I can help answer questions using the knowledge base and show the sources used for each response.',
   sources: [],
   feedbackStatus: null,
+  run_id: null,
+  question: null,
 }
 
 function App() {
   const [messages, setMessages] = useState([welcomeMessage])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [loadingStage, setLoadingStage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const [openSources, setOpenSources] = useState({})
+  const [openSourcePanels, setOpenSourcePanels] = useState({})
   const [conversations, setConversations] = useState([])
   const [activeConversationId, setActiveConversationId] = useState(null)
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
+
+  const [deleteTarget, setDeleteTarget] = useState(null)
+
+  const [showFeedbackPanel, setShowFeedbackPanel] = useState(false)
+  const [feedbackSummary, setFeedbackSummary] = useState(null)
+  const [feedbackLogs, setFeedbackLogs] = useState([])
+  const [isFeedbackLoading, setIsFeedbackLoading] = useState(false)
+
+  const [renamingConversationId, setRenamingConversationId] = useState(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [titleOverrides, setTitleOverrides] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(TITLE_OVERRIDES_KEY) || '{}')
+    } catch {
+      return {}
+    }
+  })
 
   const [showTour, setShowTour] = useState(() => {
     return localStorage.getItem('ragTourCompleted') !== 'true'
@@ -44,6 +75,15 @@ function App() {
   const [tourStep, setTourStep] = useState(0)
 
   const messagesEndRef = useRef(null)
+
+  const activeConversation = useMemo(() => {
+    return conversations.find((conversation) => conversation.id === activeConversationId)
+  }, [conversations, activeConversationId])
+
+  const activeConversationTitle =
+    activeConversationId && titleOverrides[activeConversationId]
+      ? titleOverrides[activeConversationId]
+      : activeConversation?.title
 
   const tourSteps = [
     {
@@ -91,6 +131,15 @@ function App() {
     return 'left-6 top-6'
   }
 
+  function getConversationTitle(conversation) {
+    return titleOverrides[conversation.id] || conversation.title || 'Untitled chat'
+  }
+
+  function saveTitleOverrides(nextOverrides) {
+    setTitleOverrides(nextOverrides)
+    localStorage.setItem(TITLE_OVERRIDES_KEY, JSON.stringify(nextOverrides))
+  }
+
   async function loadConversations() {
     try {
       const response = await fetch(CONVERSATIONS_API_URL)
@@ -108,7 +157,7 @@ function App() {
   }
 
   async function loadConversation(conversationId) {
-    if (isLoading) return
+    if (isLoading || renamingConversationId) return
 
     try {
       setErrorMessage('')
@@ -121,36 +170,48 @@ function App() {
 
       const data = await response.json()
 
-      const loadedMessages = data.messages.map((message) => ({
-        id: `${data.id}-${message.id}`,
-        role: message.role,
-        content: message.content,
-        sources: message.sources || [],
-        feedbackStatus: null,
-        run_id: null,
-        question: message.role === 'assistant' ? 'Loaded from history' : null,
-      }))
+      const loadedMessages = data.messages.map((message, index, allMessages) => {
+        const previousUserMessage = [...allMessages]
+          .slice(0, index)
+          .reverse()
+          .find((item) => item.role === 'user')
+
+        return {
+          id: `${data.id}-${message.id}`,
+          role: message.role,
+          content: message.content,
+          sources: message.sources || [],
+          feedbackStatus: null,
+          run_id: message.run_id || null,
+          question:
+            message.role === 'assistant'
+              ? previousUserMessage?.content || 'Loaded from history'
+              : null,
+        }
+      })
 
       setActiveConversationId(data.id)
       setMessages(loadedMessages.length > 0 ? loadedMessages : [welcomeMessage])
       setOpenSources({})
+      setOpenSourcePanels({})
     } catch (error) {
       console.error(error)
       setErrorMessage('Could not load this conversation.')
     }
   }
 
-  async function deleteConversation(conversationId) {
+  function requestDeleteConversation(conversation) {
     if (isLoading) return
+    setDeleteTarget(conversation)
+  }
 
-    const confirmed = window.confirm('Delete this chat? This cannot be undone.')
-
-    if (!confirmed) return
+  async function confirmDeleteConversation() {
+    if (!deleteTarget || isLoading) return
 
     try {
       setErrorMessage('')
 
-      const response = await fetch(`${CONVERSATIONS_API_URL}/${conversationId}`, {
+      const response = await fetch(`${CONVERSATIONS_API_URL}/${deleteTarget.id}`, {
         method: 'DELETE',
       })
 
@@ -158,17 +219,51 @@ function App() {
         throw new Error('Failed to delete conversation')
       }
 
-      if (conversationId === activeConversationId) {
+      if (deleteTarget.id === activeConversationId) {
         setActiveConversationId(null)
         setMessages([welcomeMessage])
         setOpenSources({})
+        setOpenSourcePanels({})
       }
 
+      const nextOverrides = { ...titleOverrides }
+      delete nextOverrides[deleteTarget.id]
+      saveTitleOverrides(nextOverrides)
+
+      setDeleteTarget(null)
       await loadConversations()
     } catch (error) {
       console.error(error)
       setErrorMessage('Could not delete this conversation.')
     }
+  }
+
+  function startRename(conversation) {
+    setRenamingConversationId(conversation.id)
+    setRenameValue(getConversationTitle(conversation))
+  }
+
+  function cancelRename() {
+    setRenamingConversationId(null)
+    setRenameValue('')
+  }
+
+  function saveRename(conversationId) {
+    const cleanedTitle = renameValue.trim()
+
+    if (!cleanedTitle) {
+      cancelRename()
+      return
+    }
+
+    const nextOverrides = {
+      ...titleOverrides,
+      [conversationId]: cleanedTitle,
+    }
+
+    saveTitleOverrides(nextOverrides)
+    setRenamingConversationId(null)
+    setRenameValue('')
   }
 
   function startNewChat() {
@@ -179,6 +274,43 @@ function App() {
     setInput('')
     setErrorMessage('')
     setOpenSources({})
+    setOpenSourcePanels({})
+  }
+
+  async function loadFeedbackData() {
+    setIsFeedbackLoading(true)
+    setErrorMessage('')
+
+    try {
+      const [summaryResponse, logsResponse] = await Promise.all([
+        fetch(FEEDBACK_SUMMARY_API_URL),
+        fetch(FEEDBACK_API_URL),
+      ])
+
+      if (!summaryResponse.ok) {
+        throw new Error('Failed to load feedback summary')
+      }
+
+      if (!logsResponse.ok) {
+        throw new Error('Failed to load feedback logs')
+      }
+
+      const summaryData = await summaryResponse.json()
+      const logsData = await logsResponse.json()
+
+      setFeedbackSummary(summaryData)
+      setFeedbackLogs(logsData.feedback || logsData.logs || logsData.items || logsData || [])
+    } catch (error) {
+      console.error(error)
+      setErrorMessage('Could not load feedback dashboard.')
+    } finally {
+      setIsFeedbackLoading(false)
+    }
+  }
+
+  function openFeedbackPanel() {
+    setShowFeedbackPanel(true)
+    loadFeedbackData()
   }
 
   useEffect(() => {
@@ -187,35 +319,43 @@ function App() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, isLoading])
+  }, [messages, isLoading, loadingStage])
 
-  async function handleSendMessage() {
-    if (!input.trim() || isLoading) return
+  async function streamQuestion(question, options = {}) {
+    const { appendUserMessage = true } = options
 
-    const currentInput = input
+    if (!question.trim() || isLoading) return
+
+    const currentQuestion = question.trim()
     const userMessageId = Date.now()
     const assistantMessageId = userMessageId + 1
 
-    const userMessage = {
-      id: userMessageId,
-      role: 'user',
-      content: currentInput,
-      sources: [],
+    const newMessages = []
+
+    if (appendUserMessage) {
+      newMessages.push({
+        id: userMessageId,
+        role: 'user',
+        content: currentQuestion,
+        sources: [],
+      })
     }
 
-    const assistantMessage = {
+    newMessages.push({
       id: assistantMessageId,
       role: 'assistant',
       content: '',
       sources: [],
       run_id: null,
-      question: currentInput,
+      question: currentQuestion,
       feedbackStatus: null,
-    }
+      isRegenerated: !appendUserMessage,
+    })
 
-    setMessages((prev) => [...prev, userMessage, assistantMessage])
+    setMessages((prev) => [...prev, ...newMessages])
     setInput('')
     setIsLoading(true)
+    setLoadingStage('Retrieving relevant chunks...')
     setErrorMessage('')
 
     try {
@@ -225,7 +365,7 @@ function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          question: currentInput,
+          question: currentQuestion,
           conversation_id: activeConversationId,
         }),
       })
@@ -237,6 +377,7 @@ function App() {
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+      let hasStartedAnswer = false
 
       while (true) {
         const { value, done } = await reader.read()
@@ -255,6 +396,11 @@ function App() {
           const data = JSON.parse(jsonString)
 
           if (data.type === 'token') {
+            if (!hasStartedAnswer) {
+              hasStartedAnswer = true
+              setLoadingStage('Generating answer...')
+            }
+
             setMessages((prev) =>
               prev.map((message) =>
                 message.id === assistantMessageId
@@ -268,6 +414,8 @@ function App() {
           }
 
           if (data.type === 'sources') {
+            setLoadingStage('Attaching sources...')
+
             setMessages((prev) =>
               prev.map((message) =>
                 message.id === assistantMessageId
@@ -288,6 +436,7 @@ function App() {
 
           if (data.type === 'done') {
             setIsLoading(false)
+            setLoadingStage('')
           }
         }
       }
@@ -310,7 +459,25 @@ function App() {
       )
     } finally {
       setIsLoading(false)
+      setLoadingStage('')
     }
+  }
+
+  async function handleSendMessage() {
+    await streamQuestion(input, { appendUserMessage: true })
+  }
+
+  function regenerateAnswer(message) {
+    if (isLoading) return
+
+    const question = message.question
+
+    if (!question || question === 'Loaded from history') {
+      setErrorMessage('Could not regenerate this answer because the original question was not found.')
+      return
+    }
+
+    streamQuestion(question, { appendUserMessage: true })
   }
 
   function handleKeyDown(event) {
@@ -318,6 +485,13 @@ function App() {
       event.preventDefault()
       handleSendMessage()
     }
+  }
+
+  function toggleSourcePanel(messageId) {
+    setOpenSourcePanels((prev) => ({
+      ...prev,
+      [messageId]: !prev[messageId],
+    }))
   }
 
   function toggleSource(messageId, sourceIndex) {
@@ -389,6 +563,35 @@ function App() {
     setShowTour(false)
   }
 
+  function getFeedbackMetric(possibleKeys, fallback = 0) {
+    if (!feedbackSummary || typeof feedbackSummary !== 'object') return fallback
+
+    for (const key of possibleKeys) {
+      if (feedbackSummary[key] !== undefined) {
+        return feedbackSummary[key]
+      }
+    }
+
+    return fallback
+  }
+
+  const totalFeedback =
+    getFeedbackMetric(['total_feedback', 'total', 'count'], null) ??
+    (Array.isArray(feedbackLogs) ? feedbackLogs.length : 0)
+
+  const positiveFeedback = getFeedbackMetric(
+    ['positive_feedback', 'thumbs_up', 'positive', 'helpful'],
+    0,
+  )
+
+  const negativeFeedback = getFeedbackMetric(
+    ['negative_feedback', 'thumbs_down', 'negative', 'needs_work'],
+    0,
+  )
+
+  const positiveRate =
+    totalFeedback > 0 ? Math.round((Number(positiveFeedback) / Number(totalFeedback)) * 100) : 0
+
   return (
     <div className="h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
       {showTour && (
@@ -444,6 +647,171 @@ function App() {
         </>
       )}
 
+      {deleteTarget && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/80 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-red-400/30 bg-slate-900 p-6 shadow-2xl">
+            <div className="flex items-start gap-4">
+              <div className="rounded-full bg-red-500/10 p-3 text-red-300">
+                <AlertTriangle size={24} />
+              </div>
+
+              <div className="min-w-0 flex-1">
+                <h2 className="text-xl font-bold text-white">Delete conversation?</h2>
+                <p className="mt-2 text-sm leading-relaxed text-slate-400">
+                  This will permanently delete the chat and its saved messages from the database.
+                </p>
+
+                <div className="mt-4 rounded-xl border border-white/10 bg-slate-950/60 px-3 py-2 text-sm text-slate-300">
+                  {getConversationTitle(deleteTarget)}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setDeleteTarget(null)}
+                className="rounded-xl border border-white/10 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-white/10"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                onClick={confirmDeleteConversation}
+                className="rounded-xl bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-400"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showFeedbackPanel && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/80 px-4">
+          <div className="max-h-[85vh] w-full max-w-4xl overflow-hidden rounded-2xl border border-white/10 bg-slate-900 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
+              <div>
+                <p className="text-sm font-semibold uppercase tracking-wide text-emerald-400">
+                  Feedback Dashboard
+                </p>
+                <h2 className="mt-1 text-2xl font-bold text-white">
+                  Answer quality monitoring
+                </h2>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowFeedbackPanel(false)}
+                className="rounded-xl border border-white/10 p-2 text-slate-400 hover:bg-white/10 hover:text-white"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="max-h-[70vh] overflow-y-auto p-6">
+              {isFeedbackLoading ? (
+                <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-slate-950/60 p-4 text-slate-300">
+                  <Loader2 className="animate-spin" size={18} />
+                  Loading feedback data...
+                </div>
+              ) : (
+                <>
+                  <div className="grid gap-4 md:grid-cols-4">
+                    <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                      <p className="text-xs uppercase tracking-wide text-slate-500">
+                        Total
+                      </p>
+                      <p className="mt-2 text-3xl font-bold text-white">
+                        {totalFeedback}
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-4">
+                      <p className="text-xs uppercase tracking-wide text-emerald-300">
+                        Helpful
+                      </p>
+                      <p className="mt-2 text-3xl font-bold text-emerald-200">
+                        {positiveFeedback}
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-red-400/20 bg-red-400/10 p-4">
+                      <p className="text-xs uppercase tracking-wide text-red-300">
+                        Needs work
+                      </p>
+                      <p className="mt-2 text-3xl font-bold text-red-200">
+                        {negativeFeedback}
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                      <p className="text-xs uppercase tracking-wide text-slate-500">
+                        Positive rate
+                      </p>
+                      <p className="mt-2 text-3xl font-bold text-white">
+                        {positiveRate}%
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                    <div className="mb-4 flex items-center justify-between">
+                      <h3 className="font-semibold text-white">Recent feedback</h3>
+
+                      <button
+                        type="button"
+                        onClick={loadFeedbackData}
+                        className="rounded-lg border border-white/10 px-3 py-1 text-xs text-slate-300 hover:bg-white/10"
+                      >
+                        Refresh
+                      </button>
+                    </div>
+
+                    {!Array.isArray(feedbackLogs) || feedbackLogs.length === 0 ? (
+                      <p className="text-sm text-slate-400">
+                        No feedback entries found yet. Try pressing Helpful or Needs work on an answer.
+                      </p>
+                    ) : (
+                      <div className="space-y-3">
+                        {feedbackLogs.slice(-8).reverse().map((item, index) => (
+                          <div
+                            key={`${item.timestamp || item.created_at || index}`}
+                            className="rounded-xl border border-white/10 bg-slate-900/80 p-3"
+                          >
+                            <div className="mb-2 flex items-center justify-between gap-3">
+                              <span
+                                className={`rounded-full px-2 py-1 text-xs font-semibold ${
+                                  item.feedback === 'thumbs_up' ||
+                                  item.feedback === 'helpful'
+                                    ? 'bg-emerald-400/10 text-emerald-300'
+                                    : 'bg-red-400/10 text-red-300'
+                                }`}
+                              >
+                                {item.feedback || item.score || 'feedback'}
+                              </span>
+
+                              <span className="text-xs text-slate-500">
+                                {item.timestamp || item.created_at || ''}
+                              </span>
+                            </div>
+
+                            <p className="line-clamp-2 text-sm text-slate-300">
+                              {item.question || 'No question available'}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="flex h-full w-full overflow-hidden px-4 py-6">
         <button
           type="button"
@@ -472,6 +840,15 @@ function App() {
               New Chat
             </button>
 
+            <button
+              type="button"
+              onClick={openFeedbackPanel}
+              className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-3 font-semibold text-slate-200 hover:bg-white/10"
+            >
+              <BarChart3 size={18} />
+              Feedback Dashboard
+            </button>
+
             <div className={`mt-5 rounded-xl ${getTourHighlightClass('history')}`}>
               <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">
                 Chat History
@@ -479,49 +856,98 @@ function App() {
 
               <div className="space-y-2">
                 {conversations.length === 0 ? (
-                  <p className="rounded-xl border border-white/10 bg-slate-900/60 px-3 py-3 text-sm text-slate-400">
-                    No saved chats yet.
-                  </p>
+                  <div className="rounded-xl border border-white/10 bg-slate-900/60 px-3 py-4 text-sm text-slate-400">
+                    <p className="font-medium text-slate-300">No saved chats yet.</p>
+                    <p className="mt-1 text-xs">
+                      Ask your first question and the chat will appear here automatically.
+                    </p>
+                  </div>
                 ) : (
                   conversations.map((conversation) => {
                     const isActive = conversation.id === activeConversationId
+                    const isRenaming = renamingConversationId === conversation.id
 
                     return (
                       <div
                         key={conversation.id}
-                        className={`flex items-start gap-2 rounded-xl border px-3 py-3 text-left text-sm transition ${
+                        className={`rounded-xl border px-3 py-3 text-left text-sm transition ${
                           isActive
                             ? 'border-emerald-400 bg-emerald-400/10 text-emerald-100'
                             : 'border-white/10 bg-slate-900/60 text-slate-300 hover:bg-white/10'
                         }`}
                       >
-                        <button
-                          type="button"
-                          onClick={() => loadConversation(conversation.id)}
-                          disabled={isLoading}
-                          className="flex min-w-0 flex-1 items-start gap-2 text-left disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                          <MessageSquare
-                            size={16}
-                            className={
-                              isActive ? 'text-emerald-300' : 'text-slate-500'
-                            }
-                          />
+                        {isRenaming ? (
+                          <div className="space-y-2">
+                            <input
+                              value={renameValue}
+                              onChange={(event) => setRenameValue(event.target.value)}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter') saveRename(conversation.id)
+                                if (event.key === 'Escape') cancelRename()
+                              }}
+                              autoFocus
+                              className="w-full rounded-lg border border-white/10 bg-slate-950 px-2 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400"
+                            />
 
-                          <span className="line-clamp-2">
-                            {conversation.title || 'Untitled chat'}
-                          </span>
-                        </button>
+                            <div className="flex justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={cancelRename}
+                                className="rounded-lg border border-white/10 p-1 text-slate-400 hover:bg-white/10"
+                              >
+                                <X size={15} />
+                              </button>
 
-                        <button
-                          type="button"
-                          onClick={() => deleteConversation(conversation.id)}
-                          disabled={isLoading}
-                          className="shrink-0 rounded-lg p-1 text-slate-500 hover:bg-red-500/10 hover:text-red-300 disabled:cursor-not-allowed disabled:opacity-50"
-                          title="Delete chat"
-                        >
-                          <Trash2 size={15} />
-                        </button>
+                              <button
+                                type="button"
+                                onClick={() => saveRename(conversation.id)}
+                                className="rounded-lg bg-emerald-500 p-1 text-slate-950 hover:bg-emerald-400"
+                              >
+                                <Check size={15} />
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-start gap-2">
+                            <button
+                              type="button"
+                              onClick={() => loadConversation(conversation.id)}
+                              disabled={isLoading}
+                              className="flex min-w-0 flex-1 items-start gap-2 text-left disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              <MessageSquare
+                                size={16}
+                                className={
+                                  isActive ? 'text-emerald-300' : 'text-slate-500'
+                                }
+                              />
+
+                              <span className="line-clamp-2">
+                                {getConversationTitle(conversation)}
+                              </span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => startRename(conversation)}
+                              disabled={isLoading}
+                              className="shrink-0 rounded-lg p-1 text-slate-500 hover:bg-white/10 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+                              title="Rename chat"
+                            >
+                              <Pencil size={14} />
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => requestDeleteConversation(conversation)}
+                              disabled={isLoading}
+                              className="shrink-0 rounded-lg p-1 text-slate-500 hover:bg-red-500/10 hover:text-red-300 disabled:cursor-not-allowed disabled:opacity-50"
+                              title="Delete chat"
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                          </div>
+                        )}
                       </div>
                     )
                   })
@@ -533,21 +959,34 @@ function App() {
 
         <div className="flex h-full min-w-0 flex-1 flex-col overflow-hidden">
           <header className="mb-4 shrink-0 rounded-2xl border border-white/10 bg-white/5 px-6 py-4 shadow-xl">
-            <p className="text-sm font-medium text-emerald-400">
-              Dar Technology Department
-            </p>
-            <h1 className="mt-1 text-2xl font-bold tracking-tight">
-              RAG Assistant
-            </h1>
-            <p className="mt-1 text-sm text-slate-400">
-              Ask questions, review sourced answers, and provide feedback.
-            </p>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium text-emerald-400">
+                  Dar Technology Department
+                </p>
+                <h1 className="mt-1 text-2xl font-bold tracking-tight">
+                  RAG Assistant
+                </h1>
+                <p className="mt-1 text-sm text-slate-400">
+                  Ask questions, review sourced answers, and monitor answer quality.
+                </p>
 
-            {activeConversationId && (
-              <p className="mt-2 text-xs text-slate-500">
-                Active conversation ID: {activeConversationId}
-              </p>
-            )}
+                {activeConversationId && (
+                  <p className="mt-2 text-xs text-slate-500">
+                    Active chat: {activeConversationTitle || `Conversation ${activeConversationId}`}
+                  </p>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={openFeedbackPanel}
+                className="hidden items-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10 md:flex"
+              >
+                <BarChart3 size={16} />
+                Feedback
+              </button>
+            </div>
           </header>
 
           {errorMessage && (
@@ -562,8 +1001,34 @@ function App() {
             )}`}
           >
             <section className="min-h-0 flex-1 space-y-4 overflow-y-auto p-6">
+              {messages.length === 1 && messages[0].id === welcomeMessage.id && (
+                <div className="mb-4 rounded-2xl border border-white/10 bg-slate-900/40 p-5">
+                  <p className="text-sm font-semibold uppercase tracking-wide text-emerald-400">
+                    Suggested questions
+                  </p>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-3">
+                    {[
+                      'What are the CIS Controls?',
+                      'Why are CIS Controls useful?',
+                      'Summarize Control 01.',
+                    ].map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        onClick={() => setInput(suggestion)}
+                        className="rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-left text-sm text-slate-300 hover:border-emerald-400/40 hover:bg-emerald-400/10"
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {messages.map((message) => {
                 const isUser = message.role === 'user'
+                const isSourcePanelOpen = openSourcePanels[message.id]
 
                 return (
                   <div
@@ -629,70 +1094,88 @@ function App() {
                             {message.content}
                           </ReactMarkdown>
                         ) : (
-                          <p className="text-slate-400">Starting response...</p>
+                          <div className="flex items-center gap-2 text-slate-400">
+                            <Loader2 size={16} className="animate-spin" />
+                            <span>{loadingStage || 'Starting response...'}</span>
+                          </div>
                         )}
                       </div>
 
                       {!isUser && message.sources && message.sources.length > 0 && (
-                        <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/70 p-3">
-                          <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                            <FileText size={14} />
-                            Sources
-                          </p>
+                        <div className="mt-4">
+                          <button
+                            type="button"
+                            onClick={() => toggleSourcePanel(message.id)}
+                            className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-900/70 px-3 py-1.5 text-sm text-slate-300 hover:bg-white/10"
+                          >
+                            <FileText size={15} />
+                            Sources ({message.sources.length})
+                            {isSourcePanelOpen ? (
+                              <ChevronDown size={15} />
+                            ) : (
+                              <ChevronRight size={15} />
+                            )}
+                          </button>
 
-                          <div className="mt-3 space-y-2">
-                            {message.sources.map((source, index) => {
-                              const sourceKey = `${message.id}-${index}`
-                              const isOpen = openSources[sourceKey]
+                          {isSourcePanelOpen && (
+                            <div className="mt-3 rounded-xl border border-white/10 bg-slate-900/70 p-3">
+                              <div className="space-y-2">
+                                {message.sources.map((source, index) => {
+                                  const sourceKey = `${message.id}-${index}`
+                                  const isOpen = openSources[sourceKey]
 
-                              return (
-                                <div
-                                  key={sourceKey}
-                                  className="rounded-lg border border-white/10 bg-slate-950/50"
-                                >
-                                  <button
-                                    type="button"
-                                    onClick={() => toggleSource(message.id, index)}
-                                    className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
-                                  >
-                                    <span className="font-medium">
-                                      {source.title}
-                                      {source.page ? ` · Page ${source.page}` : ''}
-                                    </span>
+                                  return (
+                                    <div
+                                      key={sourceKey}
+                                      className="rounded-lg border border-white/10 bg-slate-950/50"
+                                    >
+                                      <button
+                                        type="button"
+                                        onClick={() => toggleSource(message.id, index)}
+                                        className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
+                                      >
+                                        <span className="font-medium">
+                                          {source.title}
+                                          {source.page ? ` · Page ${source.page}` : ''}
+                                        </span>
 
-                                    {isOpen ? (
-                                      <ChevronDown
-                                        size={16}
-                                        className="text-slate-400"
-                                      />
-                                    ) : (
-                                      <ChevronRight
-                                        size={16}
-                                        className="text-slate-400"
-                                      />
-                                    )}
-                                  </button>
+                                        {isOpen ? (
+                                          <ChevronDown
+                                            size={16}
+                                            className="text-slate-400"
+                                          />
+                                        ) : (
+                                          <ChevronRight
+                                            size={16}
+                                            className="text-slate-400"
+                                          />
+                                        )}
+                                      </button>
 
-                                  {isOpen && (
-                                    <div className="border-t border-white/10 px-3 py-2 text-sm text-slate-400">
-                                      <p>{source.snippet}</p>
+                                      {isOpen && (
+                                        <div className="border-t border-white/10 px-3 py-2 text-sm text-slate-400">
+                                          <p>{source.snippet}</p>
 
-                                      <div className="mt-2 text-xs text-slate-500">
-                                        <p>Document: {source.title}</p>
-                                        <p>Page: {source.page || 'Not available'}</p>
-                                      </div>
+                                          <div className="mt-2 text-xs text-slate-500">
+                                            <p>Document: {source.title}</p>
+                                            <p>
+                                              Page: {source.page || 'Not available'}
+                                            </p>
+                                          </div>
+                                        </div>
+                                      )}
                                     </div>
-                                  )}
-                                </div>
-                              )
-                            })}
-                          </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
 
                       {!isUser && (
                         <div
-                          className={`mt-4 flex items-center gap-2 ${getTourHighlightClass(
+                          className={`mt-4 flex flex-wrap items-center gap-2 ${getTourHighlightClass(
                             'sources-feedback',
                           )}`}
                         >
@@ -722,6 +1205,15 @@ function App() {
                             Needs work
                           </button>
 
+                          <button
+                            onClick={() => regenerateAnswer(message)}
+                            disabled={isLoading || !message.content}
+                            className="flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-sm text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <RotateCcw size={15} />
+                            Regenerate
+                          </button>
+
                           {message.feedbackStatus && (
                             <span className="ml-2 text-xs text-slate-400">
                               Feedback saved
@@ -734,8 +1226,11 @@ function App() {
                 )
               })}
 
-              {isLoading && (
-                <p className="text-sm text-slate-400">Assistant is typing...</p>
+              {isLoading && loadingStage && (
+                <div className="flex items-center gap-2 text-sm text-slate-400">
+                  <Loader2 size={16} className="animate-spin" />
+                  {loadingStage}
+                </div>
               )}
 
               <div ref={messagesEndRef} />
