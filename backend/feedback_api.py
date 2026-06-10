@@ -2,30 +2,30 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional, List
+from typing import List, Literal, Optional
 from uuid import UUID
+
 import requests
 import weaviate
-from sentence_transformers import SentenceTransformer, CrossEncoder
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langsmith import Client
 from pydantic import BaseModel, Field
+from sentence_transformers import CrossEncoder, SentenceTransformer
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 
 load_dotenv()
 
 app = FastAPI(
     title="RAG Feedback API",
-    description="Backend API for chat, streaming responses, sources, and feedback.",
+    description="Backend API for chat, streaming responses, sources, feedback, and chat history.",
     version="1.0.0",
 )
 
-# Allow React frontend to call FastAPI backend.
-# React: http://localhost:5173
-# FastAPI: http://127.0.0.1:8000
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -37,23 +37,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-langsmith_client = Client()
+# -----------------------------
+# Config
+# -----------------------------
 
 LOCAL_FEEDBACK_FILE = Path("feedback_logs.jsonl")
 
+DATABASE_URL = "mysql+pymysql://root:rootpassword@127.0.0.1:3307/rag_app"
+
 OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+)
+
+langsmith_client = Client()
 
 embedding_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
-def get_weaviate_collection():
-    client = weaviate.connect_to_local()
-    return client.collections.get("CISControlsChunks")
+# -----------------------------
+# Database initialization
+# -----------------------------
+
+def init_database():
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    title VARCHAR(255) NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    conversation_id INT NOT NULL,
+                    role VARCHAR(20) NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS message_sources (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    message_id INT NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    page INT NULL,
+                    snippet TEXT NULL,
+                    FOREIGN KEY (message_id) REFERENCES messages(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+        )
+
+
+init_database()
+
+
 # -----------------------------
 # Data models
 # -----------------------------
+
+class Source(BaseModel):
+    title: str
+    page: Optional[int] = None
+    snippet: str
+
 
 class FeedbackRequest(BaseModel):
     question: str = Field(..., min_length=1)
@@ -75,18 +150,47 @@ class FeedbackResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
-
-
-class Source(BaseModel):
-    title: str
-    page: Optional[int] = None
-    snippet: str
+    conversation_id: Optional[int] = None
 
 
 class ChatResponse(BaseModel):
     answer: str
     sources: List[Source]
     run_id: Optional[str] = None
+    conversation_id: Optional[int] = None
+
+
+class ConversationCreateRequest(BaseModel):
+    title: str
+
+
+class ConversationResponse(BaseModel):
+    id: int
+    title: str
+    created_at: str
+    updated_at: str
+
+
+class MessageCreateRequest(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+    sources: List[Source] = []
+
+
+class MessageResponse(BaseModel):
+    id: int
+    role: str
+    content: str
+    sources: List[Source]
+    created_at: str
+
+
+class ConversationDetailResponse(BaseModel):
+    id: int
+    title: str
+    created_at: str
+    updated_at: str
+    messages: List[MessageResponse]
 
 
 # -----------------------------
@@ -102,134 +206,405 @@ def health_check():
 
 
 # -----------------------------
-# Mock RAG logic for Day 2
-# Later this will be replaced by real retrieval + generation.
+# Conversation endpoints
 # -----------------------------
 
-def generate_mock_rag_answer(question: str) -> dict:
-    question_lower = question.lower()
+@app.post("/api/conversations")
+def create_conversation(payload: ConversationCreateRequest):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    if "control 01" in question_lower or "control 1" in question_lower:
-        return {
-            "answer": (
-                "**Control 01** is about the **inventory and control of enterprise assets**.\n\n"
-                "Its goal is to help an organization know exactly what devices, systems, "
-                "and assets are connected to its environment.\n\n"
-                "This matters because:\n"
-                "- you cannot protect assets you do not know exist,\n"
-                "- unknown devices can create security risks,\n"
-                "- accurate inventories help teams monitor and secure their systems."
+    with SessionLocal() as session:
+        result = session.execute(
+            text(
+                """
+                INSERT INTO conversations (title, created_at, updated_at)
+                VALUES (:title, :created_at, :updated_at)
+                """
             ),
-            "sources": [
-                {
-                    "title": "CIS Controls v8 PDF",
-                    "page": 11,
-                    "snippet": "Control 01 focuses on the inventory and control of enterprise assets.",
-                }
-            ],
-        }
+            {
+                "title": payload.title,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
 
-    if "cis controls" in question_lower:
-        return {
-            "answer": (
-                "**The CIS Controls** are a prioritized set of cybersecurity best practices.\n\n"
-                "They help organizations reduce risk by focusing on practical defensive "
-                "actions against common cyber threats.\n\n"
-                "Key ideas include:\n"
-                "- identifying important assets,\n"
-                "- protecting systems and data,\n"
-                "- detecting weaknesses early,\n"
-                "- improving the organization’s security posture over time."
-            ),
-            "sources": [
-                {
-                    "title": "CIS Controls v8 PDF",
-                    "page": 11,
-                    "snippet": "The CIS Controls are defensive actions that help organizations improve cybersecurity.",
-                }
-            ],
-        }
+        session.commit()
+        conversation_id = result.lastrowid
 
     return {
-        "answer": (
-            "I received your question successfully.\n\n"
-            "For now, this endpoint is still using **mock RAG logic**. "
-            "The frontend and backend are connected, and the response is being streamed "
-            "from FastAPI to React.\n\n"
-            "The next step will be to connect this endpoint to the real RAG retrieval pipeline."
-        ),
-        "sources": [
+        "id": conversation_id,
+        "title": payload.title,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+
+
+@app.get("/api/conversations")
+def list_conversations():
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT id, title, created_at, updated_at
+                FROM conversations
+                ORDER BY updated_at DESC
+                """
+            )
+        ).mappings().all()
+
+    return {
+        "conversations": [
             {
-                "title": "Mock backend response",
-                "page": None,
-                "snippet": "This confirms that the backend chat endpoint is working and ready for RAG integration.",
+                "id": row["id"],
+                "title": row["title"],
+                "created_at": row["created_at"].isoformat(),
+                "updated_at": row["updated_at"].isoformat(),
             }
-        ],
+            for row in rows
+        ]
+    }
+
+
+@app.get("/api/conversations/{conversation_id}")
+def get_conversation(conversation_id: int):
+    with SessionLocal() as session:
+        conversation = session.execute(
+            text(
+                """
+                SELECT id, title, created_at, updated_at
+                FROM conversations
+                WHERE id = :conversation_id
+                """
+            ),
+            {"conversation_id": conversation_id},
+        ).mappings().first()
+
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        messages = session.execute(
+            text(
+                """
+                SELECT id, role, content, created_at
+                FROM messages
+                WHERE conversation_id = :conversation_id
+                ORDER BY created_at ASC
+                """
+            ),
+            {"conversation_id": conversation_id},
+        ).mappings().all()
+
+        message_items = []
+
+        for message in messages:
+            source_rows = session.execute(
+                text(
+                    """
+                    SELECT title, page, snippet
+                    FROM message_sources
+                    WHERE message_id = :message_id
+                    ORDER BY id ASC
+                    """
+                ),
+                {"message_id": message["id"]},
+            ).mappings().all()
+
+            message_items.append(
+                {
+                    "id": message["id"],
+                    "role": message["role"],
+                    "content": message["content"],
+                    "created_at": message["created_at"].isoformat(),
+                    "sources": [
+                        {
+                            "title": source["title"],
+                            "page": source["page"],
+                            "snippet": source["snippet"],
+                        }
+                        for source in source_rows
+                    ],
+                }
+            )
+
+    return {
+        "id": conversation["id"],
+        "title": conversation["title"],
+        "created_at": conversation["created_at"].isoformat(),
+        "updated_at": conversation["updated_at"].isoformat(),
+        "messages": message_items,
+    }
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def delete_conversation(conversation_id: int):
+    with SessionLocal() as session:
+        conversation = session.execute(
+            text(
+                """
+                SELECT id
+                FROM conversations
+                WHERE id = :conversation_id
+                """
+            ),
+            {"conversation_id": conversation_id},
+        ).mappings().first()
+
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        session.execute(
+            text(
+                """
+                DELETE FROM conversations
+                WHERE id = :conversation_id
+                """
+            ),
+            {"conversation_id": conversation_id},
+        )
+
+        session.commit()
+
+    return {
+        "status": "success",
+        "message": "Conversation deleted successfully",
+        "conversation_id": conversation_id,
+    }
+
+
+@app.post("/api/conversations/{conversation_id}/messages")
+def save_message(conversation_id: int, payload: MessageCreateRequest):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with SessionLocal() as session:
+        conversation = session.execute(
+            text(
+                """
+                SELECT id
+                FROM conversations
+                WHERE id = :conversation_id
+                """
+            ),
+            {"conversation_id": conversation_id},
+        ).mappings().first()
+
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        result = session.execute(
+            text(
+                """
+                INSERT INTO messages (conversation_id, role, content, created_at)
+                VALUES (:conversation_id, :role, :content, :created_at)
+                """
+            ),
+            {
+                "conversation_id": conversation_id,
+                "role": payload.role,
+                "content": payload.content,
+                "created_at": now,
+            },
+        )
+
+        message_id = result.lastrowid
+
+        for source in payload.sources:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO message_sources (message_id, title, page, snippet)
+                    VALUES (:message_id, :title, :page, :snippet)
+                    """
+                ),
+                {
+                    "message_id": message_id,
+                    "title": source.title,
+                    "page": source.page,
+                    "snippet": source.snippet,
+                },
+            )
+
+        session.execute(
+            text(
+                """
+                UPDATE conversations
+                SET updated_at = :updated_at
+                WHERE id = :conversation_id
+                """
+            ),
+            {
+                "updated_at": now,
+                "conversation_id": conversation_id,
+            },
+        )
+
+        session.commit()
+
+    return {
+        "id": message_id,
+        "conversation_id": conversation_id,
+        "role": payload.role,
+        "content": payload.content,
+        "sources": payload.sources,
+        "created_at": now.isoformat(),
     }
 
 
 # -----------------------------
-# Normal chat endpoint
-# Returns the full answer at once.
-# Good fallback endpoint.
+# Chat persistence helpers
 # -----------------------------
+
+def create_conversation_from_question(question: str) -> int:
+    title = question.strip()[:60]
+
+    if not title:
+        title = "New chat"
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with SessionLocal() as session:
+        result = session.execute(
+            text(
+                """
+                INSERT INTO conversations (title, created_at, updated_at)
+                VALUES (:title, :created_at, :updated_at)
+                """
+            ),
+            {
+                "title": title,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+
+        session.commit()
+        return result.lastrowid
+
+
+def save_chat_message(
+    conversation_id: int,
+    role: str,
+    content: str,
+    sources: Optional[list[dict]] = None,
+) -> int:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with SessionLocal() as session:
+        result = session.execute(
+            text(
+                """
+                INSERT INTO messages (conversation_id, role, content, created_at)
+                VALUES (:conversation_id, :role, :content, :created_at)
+                """
+            ),
+            {
+                "conversation_id": conversation_id,
+                "role": role,
+                "content": content,
+                "created_at": now,
+            },
+        )
+
+        message_id = result.lastrowid
+
+        if sources:
+            for source in sources:
+                session.execute(
+                    text(
+                        """
+                        INSERT INTO message_sources (message_id, title, page, snippet)
+                        VALUES (:message_id, :title, :page, :snippet)
+                        """
+                    ),
+                    {
+                        "message_id": message_id,
+                        "title": source.get("title", "Unknown source"),
+                        "page": source.get("page"),
+                        "snippet": source.get("snippet", ""),
+                    },
+                )
+
+        session.execute(
+            text(
+                """
+                UPDATE conversations
+                SET updated_at = :updated_at
+                WHERE id = :conversation_id
+                """
+            ),
+            {
+                "updated_at": now,
+                "conversation_id": conversation_id,
+            },
+        )
+
+        session.commit()
+        return message_id
+
+
+# -----------------------------
+# RAG logic
+# -----------------------------
+
 def retrieve_relevant_chunks(
     question: str,
     retrieval_limit: int = 10,
     top_k: int = 4,
 ) -> list[dict]:
     client = weaviate.connect_to_local()
-    collection = client.collections.get("CISControlsChunks")
 
-    question_vector = embedding_model.encode(
-        question,
-        normalize_embeddings=True,
-    )
+    try:
+        collection = client.collections.get("CISControlsChunks")
 
-    results = collection.query.near_vector(
-        near_vector=question_vector.tolist(),
-        limit=retrieval_limit,
-        return_properties=["text", "source", "page_number", "chunk_id"],
-    )
-
-    chunks = []
-
-    for obj in results.objects:
-        props = obj.properties
-
-        chunks.append(
-            {
-                "text": props.get("text", ""),
-                "source": props.get("source", "CIS Controls v8 PDF"),
-                "page_number": props.get("page_number"),
-                "chunk_id": props.get("chunk_id"),
-            }
+        question_vector = embedding_model.encode(
+            question,
+            normalize_embeddings=True,
         )
 
-    client.close()
-
-    if not chunks:
-        return []
-
-    pairs = [(question, chunk["text"]) for chunk in chunks]
-    scores = reranker_model.predict(pairs)
-
-    ranked_chunks = []
-
-    for chunk, score in zip(chunks, scores):
-        ranked_chunks.append(
-            {
-                **chunk,
-                "rerank_score": float(score),
-            }
+        results = collection.query.near_vector(
+            near_vector=question_vector.tolist(),
+            limit=retrieval_limit,
+            return_properties=["text", "source", "page_number", "chunk_id"],
         )
 
-    ranked_chunks.sort(
-        key=lambda item: item["rerank_score"],
-        reverse=True,
-    )
+        chunks = []
 
-    return ranked_chunks[:top_k]
+        for obj in results.objects:
+            props = obj.properties
+
+            chunks.append(
+                {
+                    "text": props.get("text", ""),
+                    "source": props.get("source", "CIS Controls v8 PDF"),
+                    "page_number": props.get("page_number"),
+                    "chunk_id": props.get("chunk_id"),
+                }
+            )
+
+        if not chunks:
+            return []
+
+        pairs = [(question, chunk["text"]) for chunk in chunks]
+        scores = reranker_model.predict(pairs)
+
+        ranked_chunks = []
+
+        for chunk, score in zip(chunks, scores):
+            ranked_chunks.append(
+                {
+                    **chunk,
+                    "rerank_score": float(score),
+                }
+            )
+
+        ranked_chunks.sort(
+            key=lambda item: item["rerank_score"],
+            reverse=True,
+        )
+
+        return ranked_chunks[:top_k]
+
+    finally:
+        client.close()
 
 
 def build_rag_prompt(question: str, chunks: list[dict]) -> str:
@@ -318,32 +693,75 @@ def generate_rag_answer(question: str) -> dict:
         "answer": answer,
         "sources": sources,
     }
-    
-@app.post("/api/chat", response_model=ChatResponse)
+
+
+# -----------------------------
+# Chat endpoints
+# -----------------------------
+
+@app.post("/api/chat")
 def chat(request: ChatRequest):
     question = request.question.strip()
 
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    conversation_id = request.conversation_id
+
+    if conversation_id is None:
+        conversation_id = create_conversation_from_question(question)
+
+    save_chat_message(
+        conversation_id=conversation_id,
+        role="user",
+        content=question,
+    )
+
     result = generate_rag_answer(question)
+
+    save_chat_message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=result["answer"],
+        sources=result["sources"],
+    )
 
     return {
         "answer": result["answer"],
         "sources": result["sources"],
         "run_id": None,
+        "conversation_id": conversation_id,
     }
 
-
-# -----------------------------
-# Streaming chat endpoint
-# Sends the answer gradually using Server-Sent Events.
-# -----------------------------
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
     question = request.question.strip()
 
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    conversation_id = request.conversation_id
+
+    if conversation_id is None:
+        conversation_id = create_conversation_from_question(question)
+
+    save_chat_message(
+        conversation_id=conversation_id,
+        role="user",
+        content=question,
+    )
+
     result = generate_rag_answer(question)
     answer = result["answer"]
     sources = result["sources"]
+
+    save_chat_message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=answer,
+        sources=sources,
+    )
 
     async def event_generator():
         words = answer.split(" ")
@@ -361,6 +779,7 @@ async def chat_stream(request: ChatRequest):
             "type": "sources",
             "sources": sources,
             "run_id": None,
+            "conversation_id": conversation_id,
         }
 
         yield f"data: {json.dumps(sources_event, ensure_ascii=False)}\n\n"
@@ -402,10 +821,8 @@ def collect_feedback(payload: FeedbackRequest):
         "run_id": str(payload.run_id) if payload.run_id else None,
     }
 
-    # Always save locally, so feedback is not lost.
     save_feedback_locally(feedback_record)
 
-    # If no LangSmith run_id is provided, feedback cannot be attached to a trace yet.
     if payload.run_id is None:
         return FeedbackResponse(
             status="success",
