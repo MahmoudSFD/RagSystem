@@ -18,6 +18,8 @@ import {
   Check,
   AlertTriangle,
   Loader2,
+  Download,
+  Columns3,
 } from 'lucide-react'
 
 import ReactMarkdown from 'react-markdown'
@@ -26,16 +28,7 @@ const FEEDBACK_API_URL = 'http://127.0.0.1:8000/api/feedback'
 const FEEDBACK_SUMMARY_API_URL = 'http://127.0.0.1:8000/api/feedback/summary'
 const CHAT_STREAM_API_URL = 'http://127.0.0.1:8000/api/chat/stream'
 const CONVERSATIONS_API_URL = 'http://127.0.0.1:8000/api/conversations'
-const MESSAGE_API_BASE_URL = 'http://127.0.0.1:8000/api/messages'
-
-const NEGATIVE_FEEDBACK_REASONS = [
-  'Answer is incorrect',
-  'Sources do not support the answer',
-  'Missing important details',
-  'Too vague or unclear',
-  'Other',
-]
-
+const MESSAGES_API_URL = 'http://127.0.0.1:8000/api/messages'
 
 const TITLE_OVERRIDES_KEY = 'ragConversationTitleOverrides'
 
@@ -48,11 +41,19 @@ const welcomeMessage = {
   feedbackStatus: null,
   run_id: null,
   question: null,
-  dbMessageId: null,
+  backend_id: null,
+  message_id: null,
   version_id: null,
   version_number: null,
-  versions: [],
 }
+
+const negativeFeedbackReasons = [
+  'Incorrect answer',
+  'Missing important context',
+  'Weak or irrelevant sources',
+  'Unclear explanation',
+  'Other',
+]
 
 function App() {
   const [messages, setMessages] = useState([welcomeMessage])
@@ -67,15 +68,25 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
 
   const [deleteTarget, setDeleteTarget] = useState(null)
-
-  const [feedbackTarget, setFeedbackTarget] = useState(null)
-  const [feedbackReason, setFeedbackReason] = useState('')
-  const [feedbackComment, setFeedbackComment] = useState('')
+  const [showClearAllModal, setShowClearAllModal] = useState(false)
+  const [isClearingHistory, setIsClearingHistory] = useState(false)
 
   const [showFeedbackPanel, setShowFeedbackPanel] = useState(false)
   const [feedbackSummary, setFeedbackSummary] = useState(null)
   const [feedbackLogs, setFeedbackLogs] = useState([])
   const [isFeedbackLoading, setIsFeedbackLoading] = useState(false)
+
+  const [feedbackTarget, setFeedbackTarget] = useState(null)
+  const [feedbackReason, setFeedbackReason] = useState('')
+  const [feedbackComment, setFeedbackComment] = useState('')
+
+  const [versionCache, setVersionCache] = useState({})
+  const [loadingVersionsFor, setLoadingVersionsFor] = useState(null)
+
+  const [comparisonTarget, setComparisonTarget] = useState(null)
+  const [comparisonVersions, setComparisonVersions] = useState([])
+  const [isComparisonLoading, setIsComparisonLoading] = useState(false)
+  const [openComparisonSources, setOpenComparisonSources] = useState({})
 
   const [renamingConversationId, setRenamingConversationId] = useState(null)
   const [renameValue, setRenameValue] = useState('')
@@ -153,25 +164,48 @@ function App() {
     return titleOverrides[conversation.id] || conversation.title || 'Untitled chat'
   }
 
-  function addInlineCitationLinks(content, sources, messageId) {
-    if (!content || !Array.isArray(sources) || sources.length === 0) {
-      return content
-    }
-
-    return content.replace(/\[(\d+)\](?!\()/g, (match, numberText) => {
-      const sourceIndex = Number(numberText) - 1
-
-      if (!sources[sourceIndex]) {
-        return match
-      }
-
-      return `[${numberText}](#source-${messageId}-${sourceIndex})`
-    })
-  }
-
   function saveTitleOverrides(nextOverrides) {
     setTitleOverrides(nextOverrides)
     localStorage.setItem(TITLE_OVERRIDES_KEY, JSON.stringify(nextOverrides))
+  }
+
+  function getBackendMessageId(message) {
+    return message.backend_id || message.message_id || message.messageId || null
+  }
+
+  function getMessageVersionId(message) {
+    return message.version_id || message.versionId || null
+  }
+
+  function getMessageVersionNumber(message) {
+    return message.version_number || message.versionNumber || null
+  }
+
+  function normalizeCitationMarkdown(content) {
+    if (!content) return ''
+
+    return content.replace(/\[(\d+)\]/g, (match, number) => {
+      return `[${match}](citation:${number})`
+    })
+  }
+
+  function openCitationSource(messageId, sourceIndex) {
+    setOpenSourcePanels((prev) => ({
+      ...prev,
+      [messageId]: true,
+    }))
+
+    setOpenSources((prev) => ({
+      ...prev,
+      [`${messageId}-${sourceIndex}`]: true,
+    }))
+  }
+
+  function toggleComparisonSources(versionKey) {
+    setOpenComparisonSources((prev) => ({
+      ...prev,
+      [versionKey]: !prev[versionKey],
+    }))
   }
 
   async function loadConversations() {
@@ -212,7 +246,8 @@ function App() {
 
         return {
           id: `${data.id}-${message.id}`,
-          dbMessageId: message.id,
+          backend_id: message.id,
+          message_id: message.id,
           role: message.role,
           content: message.content,
           sources: message.sources || [],
@@ -220,7 +255,6 @@ function App() {
           run_id: message.run_id || null,
           version_id: message.version_id || null,
           version_number: message.version_number || null,
-          versions: [],
           question:
             message.role === 'assistant'
               ? previousUserMessage?.content || 'Loaded from history'
@@ -239,12 +273,12 @@ function App() {
   }
 
   function requestDeleteConversation(conversation) {
-    if (isLoading) return
+    if (isLoading || isClearingHistory) return
     setDeleteTarget(conversation)
   }
 
   async function confirmDeleteConversation() {
-    if (!deleteTarget || isLoading) return
+    if (!deleteTarget || isLoading || isClearingHistory) return
 
     try {
       setErrorMessage('')
@@ -273,6 +307,42 @@ function App() {
     } catch (error) {
       console.error(error)
       setErrorMessage('Could not delete this conversation.')
+    }
+  }
+
+  async function confirmClearAllHistory() {
+    if (isLoading || isClearingHistory || conversations.length === 0) return
+
+    setIsClearingHistory(true)
+    setErrorMessage('')
+
+    try {
+      const deleteRequests = conversations.map((conversation) =>
+        fetch(`${CONVERSATIONS_API_URL}/${conversation.id}`, {
+          method: 'DELETE',
+        }),
+      )
+
+      const responses = await Promise.all(deleteRequests)
+      const failedDelete = responses.some((response) => !response.ok)
+
+      if (failedDelete) {
+        throw new Error('One or more conversations could not be deleted')
+      }
+
+      setActiveConversationId(null)
+      setMessages([welcomeMessage])
+      setOpenSources({})
+      setOpenSourcePanels({})
+      setVersionCache({})
+      setShowClearAllModal(false)
+      saveTitleOverrides({})
+      await loadConversations()
+    } catch (error) {
+      console.error(error)
+      setErrorMessage('Could not clear all chat history.')
+    } finally {
+      setIsClearingHistory(false)
     }
   }
 
@@ -351,6 +421,255 @@ function App() {
     loadFeedbackData()
   }
 
+  function exportConversationAsMarkdown() {
+    const title =
+      activeConversationTitle ||
+      (activeConversationId ? `Conversation ${activeConversationId}` : 'New Chat')
+
+    const createdAt = new Date().toLocaleString()
+
+    const markdownLines = [
+      `# ${title}`,
+      '',
+      `Exported at: ${createdAt}`,
+      '',
+      '---',
+      '',
+    ]
+
+    messages
+      .filter((message) => message.content && message.content.trim())
+      .forEach((message) => {
+        const speaker = message.role === 'user' ? 'User' : 'Assistant'
+
+        markdownLines.push(`## ${speaker}`)
+        markdownLines.push('')
+        markdownLines.push(message.content.trim())
+        markdownLines.push('')
+
+        if (message.role === 'assistant') {
+          const versionNumber = getMessageVersionNumber(message)
+
+          if (versionNumber) {
+            markdownLines.push(`**Version:** ${versionNumber}`)
+            markdownLines.push('')
+          }
+
+          if (message.sources && message.sources.length > 0) {
+            markdownLines.push('### Sources')
+            markdownLines.push('')
+
+            message.sources.forEach((source, index) => {
+              markdownLines.push(
+                `${index + 1}. ${source.title || 'Unknown source'}${
+                  source.page ? ` — Page ${source.page}` : ''
+                }`,
+              )
+
+              if (source.snippet) {
+                markdownLines.push(`   - ${source.snippet}`)
+              }
+            })
+
+            markdownLines.push('')
+          }
+        }
+
+        markdownLines.push('---')
+        markdownLines.push('')
+      })
+
+    const blob = new Blob([markdownLines.join('\n')], {
+      type: 'text/markdown;charset=utf-8',
+    })
+
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+
+    const safeTitle = title
+      .replace(/[^a-z0-9]/gi, '_')
+      .replace(/_+/g, '_')
+      .toLowerCase()
+
+    link.href = url
+    link.download = `${safeTitle || 'rag_conversation'}.md`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  function exportConversationAsPdf() {
+    const title =
+      activeConversationTitle ||
+      (activeConversationId ? `Conversation ${activeConversationId}` : 'New Chat')
+
+    const createdAt = new Date().toLocaleString()
+
+    const escapeHtml = (value) => {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;')
+    }
+
+    const conversationHtml = messages
+      .filter((message) => message.content && message.content.trim())
+      .map((message) => {
+        const speaker = message.role === 'user' ? 'User' : 'Assistant'
+        const versionNumber = getMessageVersionNumber(message)
+
+        const sourcesHtml =
+          message.role === 'assistant' && message.sources && message.sources.length > 0
+            ? `
+              <div class="sources">
+                <h3>Sources</h3>
+                ${message.sources
+                  .map(
+                    (source, index) => `
+                      <div class="source">
+                        <strong>[${index + 1}] ${escapeHtml(source.title || 'Unknown source')}</strong>
+                        ${source.page ? `<span> · Page ${escapeHtml(source.page)}</span>` : ''}
+                        <p>${escapeHtml(source.snippet || 'No snippet available.')}</p>
+                      </div>
+                    `,
+                  )
+                  .join('')}
+              </div>
+            `
+            : ''
+
+        return `
+          <section class="message ${message.role}">
+            <h2>${speaker}</h2>
+            ${
+              versionNumber
+                ? `<p class="version">Version: v${escapeHtml(versionNumber)}</p>`
+                : ''
+            }
+            <div class="content">${escapeHtml(message.content).replaceAll('\n', '<br />')}</div>
+            ${sourcesHtml}
+          </section>
+        `
+      })
+      .join('')
+
+    const printWindow = window.open('', '_blank')
+
+    if (!printWindow) {
+      setErrorMessage('Could not open the PDF export window. Please allow pop-ups for this site.')
+      return
+    }
+
+    printWindow.document.write(`
+      <!doctype html>
+      <html>
+        <head>
+          <title>${escapeHtml(title)}</title>
+          <style>
+            body {
+              font-family: Arial, sans-serif;
+              color: #111827;
+              margin: 40px;
+              line-height: 1.6;
+            }
+
+            h1 {
+              margin-bottom: 4px;
+              color: #064e3b;
+            }
+
+            .meta {
+              color: #6b7280;
+              font-size: 13px;
+              margin-bottom: 24px;
+            }
+
+            .message {
+              border: 1px solid #e5e7eb;
+              border-radius: 12px;
+              padding: 16px;
+              margin-bottom: 18px;
+              page-break-inside: avoid;
+            }
+
+            .message.user {
+              background: #ecfdf5;
+            }
+
+            .message.assistant {
+              background: #f8fafc;
+            }
+
+            h2 {
+              font-size: 16px;
+              margin: 0 0 8px;
+              color: #065f46;
+            }
+
+            .version {
+              font-size: 12px;
+              color: #6b7280;
+              margin-top: -4px;
+            }
+
+            .content {
+              white-space: normal;
+              font-size: 14px;
+            }
+
+            .sources {
+              margin-top: 14px;
+              border-top: 1px solid #e5e7eb;
+              padding-top: 10px;
+            }
+
+            .sources h3 {
+              font-size: 14px;
+              margin: 0 0 8px;
+              color: #374151;
+            }
+
+            .source {
+              font-size: 12px;
+              color: #4b5563;
+              margin-bottom: 8px;
+            }
+
+            .source p {
+              margin: 4px 0 0;
+            }
+
+            @media print {
+              body {
+                margin: 24px;
+              }
+
+              button {
+                display: none;
+              }
+            }
+          </style>
+        </head>
+
+        <body>
+          <h1>${escapeHtml(title)}</h1>
+          <p class="meta">Exported at: ${escapeHtml(createdAt)}</p>
+          ${conversationHtml}
+          <script>
+            window.onload = function () {
+              window.print()
+            }
+          </script>
+        </body>
+      </html>
+    `)
+
+    printWindow.document.close()
+  }
+
   useEffect(() => {
     loadConversations()
   }, [])
@@ -373,6 +692,8 @@ function App() {
     if (appendUserMessage) {
       newMessages.push({
         id: userMessageId,
+        backend_id: null,
+        message_id: null,
         role: 'user',
         content: currentQuestion,
         sources: [],
@@ -381,6 +702,8 @@ function App() {
 
     newMessages.push({
       id: assistantMessageId,
+      backend_id: null,
+      message_id: null,
       role: 'assistant',
       content: '',
       sources: [],
@@ -388,10 +711,8 @@ function App() {
       question: currentQuestion,
       feedbackStatus: null,
       isRegenerated: !appendUserMessage,
-      dbMessageId: null,
       version_id: null,
       version_number: null,
-      versions: [],
     })
 
     setMessages((prev) => [...prev, ...newMessages])
@@ -465,23 +786,11 @@ function App() {
                       ...message,
                       sources: data.sources || [],
                       run_id: data.run_id || null,
-                      dbMessageId: data.message_id || message.dbMessageId || null,
-                      version_id: data.version_id || message.version_id || null,
-                      version_number: data.version_number || message.version_number || null,
-                      versions:
-                        data.version_id
-                          ? [
-                              {
-                                id: data.version_id,
-                                message_id: data.message_id,
-                                version_number: data.version_number || 1,
-                                content: message.content,
-                                run_id: data.run_id || null,
-                                is_selected: true,
-                                sources: data.sources || [],
-                              },
-                            ]
-                          : message.versions || [],
+                      backend_id: data.message_id || null,
+                      message_id: data.message_id || null,
+                      version_id: data.version_id || null,
+                      version_number: data.version_number || null,
+                      conversation_id: data.conversation_id || null,
                     }
                   : message,
               ),
@@ -502,7 +811,7 @@ function App() {
     } catch (error) {
       console.error(error)
       setErrorMessage(
-        'Could not stream the answer from the backend. Make sure FastAPI is running.',
+        'Could not stream the answer from the backend. Make sure FastAPI, Weaviate, MySQL, and Ollama are running.',
       )
 
       setMessages((prev) =>
@@ -529,8 +838,10 @@ function App() {
   async function regenerateAnswer(message) {
     if (isLoading) return
 
-    if (!message.dbMessageId) {
-      setErrorMessage('Could not regenerate this answer because the backend message ID was not found.')
+    const backendMessageId = getBackendMessageId(message)
+
+    if (!backendMessageId) {
+      setErrorMessage('Could not regenerate this answer because its backend message ID was not found.')
       return
     }
 
@@ -539,7 +850,7 @@ function App() {
     setErrorMessage('')
 
     try {
-      const response = await fetch(`${MESSAGE_API_BASE_URL}/${message.dbMessageId}/regenerate`, {
+      const response = await fetch(`${MESSAGES_API_URL}/${backendMessageId}/regenerate`, {
         method: 'POST',
       })
 
@@ -548,92 +859,207 @@ function App() {
       }
 
       const data = await response.json()
-      const version = data.version
-
-      setMessages((currentMessages) =>
-        currentMessages.map((currentMessage) => {
-          if (currentMessage.id !== message.id) {
-            return currentMessage
-          }
-
-          const existingVersions = currentMessage.versions || []
-          const withoutDuplicate = existingVersions.filter(
-            (item) => item.id !== version.id,
-          )
-
-          return {
-            ...currentMessage,
-            content: data.answer || version.content,
-            sources: data.sources || version.sources || [],
-            run_id: data.run_id || version.run_id || null,
-            version_id: data.version_id || version.id,
-            version_number: data.version_number || version.version_number,
-            versions: [...withoutDuplicate, version].sort(
-              (a, b) => a.version_number - b.version_number,
-            ),
-            feedbackStatus: null,
-          }
-        }),
-      )
-
-      await loadConversations()
-    } catch (error) {
-      console.error(error)
-      setErrorMessage('Could not regenerate this answer from the backend.')
-    } finally {
-      setIsLoading(false)
-      setLoadingStage('')
-    }
-  }
-
-  async function loadMessageVersions(message) {
-    if (!message.dbMessageId) {
-      setErrorMessage('Could not load versions because the backend message ID was not found.')
-      return
-    }
-
-    try {
-      setErrorMessage('')
-
-      const response = await fetch(`${MESSAGE_API_BASE_URL}/${message.dbMessageId}/versions`)
-
-      if (!response.ok) {
-        throw new Error('Failed to load message versions')
-      }
-
-      const data = await response.json()
+      const version = data.version || {}
 
       setMessages((currentMessages) =>
         currentMessages.map((currentMessage) =>
           currentMessage.id === message.id
             ? {
                 ...currentMessage,
-                versions: data.versions || [],
+                content: data.answer || version.content || currentMessage.content,
+                sources: data.sources || version.sources || [],
+                run_id: data.run_id || version.run_id || null,
+                version_id: data.version_id || version.id || null,
+                version_number: data.version_number || version.version_number || null,
+                feedbackStatus: null,
               }
             : currentMessage,
         ),
       )
+
+      setVersionCache((prev) => {
+        const existingVersions = prev[backendMessageId] || []
+        const nextVersion = data.version
+
+        if (!nextVersion) return prev
+
+        const filteredVersions = existingVersions.filter(
+          (item) => item.id !== nextVersion.id,
+        )
+
+        return {
+          ...prev,
+          [backendMessageId]: [...filteredVersions, nextVersion].sort(
+            (a, b) => a.version_number - b.version_number,
+          ),
+        }
+      })
+
+      await loadConversations()
     } catch (error) {
       console.error(error)
-      setErrorMessage('Could not load answer versions.')
+      setErrorMessage('Could not regenerate this answer.')
+    } finally {
+      setIsLoading(false)
+      setLoadingStage('')
     }
   }
 
-  function switchToVersion(messageId, version) {
+  async function loadVersions(message) {
+    const backendMessageId = getBackendMessageId(message)
+
+    if (!backendMessageId) {
+      setErrorMessage('Could not load versions because the backend message ID was not found.')
+      return
+    }
+
+    setLoadingVersionsFor(message.id)
+    setErrorMessage('')
+
+    try {
+      const response = await fetch(`${MESSAGES_API_URL}/${backendMessageId}/versions`)
+
+      if (!response.ok) {
+        throw new Error('Failed to load versions')
+      }
+
+      const data = await response.json()
+
+      setVersionCache((prev) => ({
+        ...prev,
+        [backendMessageId]: data.versions || [],
+      }))
+    } catch (error) {
+      console.error(error)
+      setErrorMessage('Could not load answer versions.')
+    } finally {
+      setLoadingVersionsFor(null)
+    }
+  }
+
+  function selectVersion(message, version) {
     setMessages((currentMessages) =>
-      currentMessages.map((message) =>
-        message.id === messageId
+      currentMessages.map((currentMessage) =>
+        currentMessage.id === message.id
           ? {
-              ...message,
-              content: version.content,
+              ...currentMessage,
+              content: version.content || currentMessage.content,
               sources: version.sources || [],
               run_id: version.run_id || null,
               version_id: version.id,
               version_number: version.version_number,
+              feedbackStatus: null,
             }
-          : message,
+          : currentMessage,
       ),
     )
+  }
+
+  async function generateComparison(message) {
+    if (isLoading || isComparisonLoading) return
+
+    const backendMessageId = getBackendMessageId(message)
+
+    if (!backendMessageId) {
+      setErrorMessage('Could not compare this answer because its backend message ID was not found.')
+      return
+    }
+
+    setErrorMessage('')
+    setComparisonTarget(message)
+    setComparisonVersions([])
+    setOpenComparisonSources({})
+    setIsComparisonLoading(true)
+
+    try {
+      const firstResponse = await fetch(`${MESSAGES_API_URL}/${backendMessageId}/regenerate`, {
+        method: 'POST',
+      })
+
+      if (!firstResponse.ok) {
+        throw new Error('Failed to generate first comparison answer')
+      }
+
+      const firstData = await firstResponse.json()
+
+      const secondResponse = await fetch(`${MESSAGES_API_URL}/${backendMessageId}/regenerate`, {
+        method: 'POST',
+      })
+
+      if (!secondResponse.ok) {
+        throw new Error('Failed to generate second comparison answer')
+      }
+
+      const secondData = await secondResponse.json()
+
+      const firstVersion = firstData.version || {
+        id: firstData.version_id,
+        content: firstData.answer,
+        sources: firstData.sources || [],
+        version_number: firstData.version_number,
+      }
+
+      const secondVersion = secondData.version || {
+        id: secondData.version_id,
+        content: secondData.answer,
+        sources: secondData.sources || [],
+        version_number: secondData.version_number,
+      }
+
+      setComparisonVersions([firstVersion, secondVersion])
+
+      setMessages((currentMessages) =>
+        currentMessages.map((currentMessage) =>
+          currentMessage.id === message.id
+            ? {
+                ...currentMessage,
+                content: secondVersion.content || secondData.answer,
+                sources: secondVersion.sources || secondData.sources || [],
+                version_id: secondVersion.id || secondData.version_id,
+                version_number: secondVersion.version_number || secondData.version_number,
+                feedbackStatus: null,
+              }
+            : currentMessage,
+        ),
+      )
+
+      setVersionCache((prev) => {
+        const existingVersions = prev[backendMessageId] || []
+        const nextVersions = [firstVersion, secondVersion].filter(Boolean)
+
+        const merged = [...existingVersions]
+
+        nextVersions.forEach((version) => {
+          const existingIndex = merged.findIndex((item) => item.id === version.id)
+
+          if (existingIndex >= 0) {
+            merged[existingIndex] = version
+          } else {
+            merged.push(version)
+          }
+        })
+
+        return {
+          ...prev,
+          [backendMessageId]: merged.sort(
+            (a, b) => a.version_number - b.version_number,
+          ),
+        }
+      })
+
+      await loadConversations()
+    } catch (error) {
+      console.error(error)
+      setErrorMessage('Could not generate comparison answers.')
+    } finally {
+      setIsComparisonLoading(false)
+    }
+  }
+
+  function closeComparisonModal() {
+    setComparisonTarget(null)
+    setComparisonVersions([])
+    setOpenComparisonSources({})
   }
 
   function handleKeyDown(event) {
@@ -659,8 +1085,11 @@ function App() {
     }))
   }
 
-  async function sendFeedback(message, feedbackType, reason = null, commentText = null) {
+  async function sendFeedback(message, feedbackType, options = {}) {
     setErrorMessage('')
+
+    const backendMessageId = getBackendMessageId(message)
+    const versionId = getMessageVersionId(message)
 
     try {
       const response = await fetch(FEEDBACK_API_URL, {
@@ -672,22 +1101,22 @@ function App() {
           question: message.question || 'Unknown question',
           answer: message.content,
           feedback: feedbackType,
-          reason,
-          conversation_id: activeConversationId,
-          message_id: message.dbMessageId || null,
-          version_id: message.version_id || null,
+          reason: options.reason || null,
           comment:
-            commentText ||
+            options.comment ||
             (feedbackType === 'thumbs_up'
               ? 'User marked the answer as helpful.'
-              : `User marked the answer as needing work. Reason: ${reason}`),
+              : 'User marked the answer as needing work.'),
+          conversation_id: activeConversationId,
+          message_id: backendMessageId,
+          version_id: versionId,
           run_id: message.run_id || null,
         }),
       })
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => null)
-        throw new Error(errorData?.detail || 'Feedback request failed')
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || 'Feedback request failed')
       }
 
       setMessages((currentMessages) =>
@@ -703,19 +1132,26 @@ function App() {
         }),
       )
 
-      await loadFeedbackData()
+      if (showFeedbackPanel) {
+        loadFeedbackData()
+      }
     } catch (error) {
       console.error(error)
       setErrorMessage(
-        error.message || 'Could not send feedback. Make sure the FastAPI backend is running.',
+        error.message ||
+          'Could not send feedback. Make sure the FastAPI backend is running.',
       )
     }
   }
 
   function openNegativeFeedbackModal(message) {
-    if (!message.content || isLoading) return
-
     setFeedbackTarget(message)
+    setFeedbackReason('')
+    setFeedbackComment('')
+  }
+
+  function closeNegativeFeedbackModal() {
+    setFeedbackTarget(null)
     setFeedbackReason('')
     setFeedbackComment('')
   }
@@ -728,16 +1164,12 @@ function App() {
       return
     }
 
-    await sendFeedback(
-      feedbackTarget,
-      'thumbs_down',
-      feedbackReason,
-      feedbackComment.trim() || null,
-    )
+    await sendFeedback(feedbackTarget, 'thumbs_down', {
+      reason: feedbackReason,
+      comment: feedbackComment || `Reason: ${feedbackReason}`,
+    })
 
-    setFeedbackTarget(null)
-    setFeedbackReason('')
-    setFeedbackComment('')
+    closeNegativeFeedbackModal()
   }
 
   function handleNextTourStep() {
@@ -786,6 +1218,35 @@ function App() {
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
+      <style>
+        {`
+          * {
+            scrollbar-width: thin;
+            scrollbar-color: #334155 #020617;
+          }
+
+          *::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+          }
+
+          *::-webkit-scrollbar-track {
+            background: #020617;
+            border-radius: 999px;
+          }
+
+          *::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 999px;
+            border: 2px solid #020617;
+          }
+
+          *::-webkit-scrollbar-thumb:hover {
+            background: #475569;
+          }
+        `}
+      </style>
+
       {showTour && (
         <>
           <div className="pointer-events-none fixed inset-0 z-20 bg-slate-950/70" />
@@ -880,45 +1341,88 @@ function App() {
         </div>
       )}
 
+      {showClearAllModal && (
+        <div className="fixed inset-0 z-[121] flex items-center justify-center bg-slate-950/80 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-red-400/30 bg-slate-900 p-6 shadow-2xl">
+            <div className="flex items-start gap-4">
+              <div className="rounded-full bg-red-500/10 p-3 text-red-300">
+                <AlertTriangle size={24} />
+              </div>
+
+              <div className="min-w-0 flex-1">
+                <h2 className="text-xl font-bold text-white">Clear all chat history?</h2>
+                <p className="mt-2 text-sm leading-relaxed text-slate-400">
+                  This will delete all saved conversations, messages, sources, and version history from the database.
+                </p>
+
+                <div className="mt-4 rounded-xl border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                  {conversations.length} conversation(s) will be deleted.
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setShowClearAllModal(false)}
+                disabled={isClearingHistory}
+                className="rounded-xl border border-white/10 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                onClick={confirmClearAllHistory}
+                disabled={isClearingHistory}
+                className="flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isClearingHistory && <Loader2 size={16} className="animate-spin" />}
+                Clear all
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {feedbackTarget && (
-        <div className="fixed inset-0 z-[115] flex items-center justify-center bg-slate-950/80 px-4">
+        <div className="fixed inset-0 z-[125] flex items-center justify-center bg-slate-950/80 px-4">
           <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
-            <div className="flex items-start justify-between gap-4">
+            <div className="mb-5 flex items-start justify-between gap-4">
               <div>
                 <p className="text-sm font-semibold uppercase tracking-wide text-red-300">
-                  Needs work
+                  Negative Feedback
                 </p>
-                <h2 className="mt-1 text-xl font-bold text-white">
-                  Why was this answer not good enough?
+                <h2 className="mt-1 text-2xl font-bold text-white">
+                  Why does this answer need work?
                 </h2>
                 <p className="mt-2 text-sm text-slate-400">
-                  A reason is required for negative feedback so the team can review answer quality later.
+                  A reason is required before saving negative feedback.
                 </p>
               </div>
 
               <button
                 type="button"
-                onClick={() => setFeedbackTarget(null)}
+                onClick={closeNegativeFeedbackModal}
                 className="rounded-xl border border-white/10 p-2 text-slate-400 hover:bg-white/10 hover:text-white"
               >
-                <X size={18} />
+                <X size={20} />
               </button>
             </div>
 
-            <div className="mt-5 space-y-2">
-              {NEGATIVE_FEEDBACK_REASONS.map((reason) => (
+            <div className="space-y-3">
+              {negativeFeedbackReasons.map((reason) => (
                 <button
                   key={reason}
                   type="button"
                   onClick={() => setFeedbackReason(reason)}
-                  className={`flex w-full items-center justify-between rounded-xl border px-4 py-3 text-left text-sm transition ${
+                  className={`w-full rounded-xl border px-4 py-3 text-left text-sm transition ${
                     feedbackReason === reason
                       ? 'border-red-400 bg-red-400/10 text-red-200'
-                      : 'border-white/10 bg-slate-950/50 text-slate-300 hover:bg-white/10'
+                      : 'border-white/10 bg-slate-950/60 text-slate-300 hover:bg-white/10'
                   }`}
                 >
-                  <span>{reason}</span>
-                  {feedbackReason === reason && <Check size={16} />}
+                  {reason}
                 </button>
               ))}
             </div>
@@ -926,14 +1430,14 @@ function App() {
             <textarea
               value={feedbackComment}
               onChange={(event) => setFeedbackComment(event.target.value)}
-              className="mt-4 min-h-24 w-full rounded-xl border border-white/10 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-red-400"
+              className="mt-4 min-h-24 w-full rounded-xl border border-white/10 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-emerald-400"
               placeholder="Optional comment..."
             />
 
             <div className="mt-6 flex justify-end gap-3">
               <button
                 type="button"
-                onClick={() => setFeedbackTarget(null)}
+                onClick={closeNegativeFeedbackModal}
                 className="rounded-xl border border-white/10 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-white/10"
               >
                 Cancel
@@ -947,6 +1451,112 @@ function App() {
               >
                 Submit feedback
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {comparisonTarget && (
+        <div className="fixed inset-0 z-[130] flex items-center justify-center bg-slate-950/80 px-4">
+          <div className="max-h-[90vh] w-full max-w-6xl overflow-hidden rounded-2xl border border-white/10 bg-slate-900 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
+              <div>
+                <p className="text-sm font-semibold uppercase tracking-wide text-emerald-400">
+                  Response Comparison Mode
+                </p>
+                <h2 className="mt-1 text-2xl font-bold text-white">
+                  Compare two regenerated answers
+                </h2>
+              </div>
+
+              <button
+                type="button"
+                onClick={closeComparisonModal}
+                className="rounded-xl border border-white/10 p-2 text-slate-400 hover:bg-white/10 hover:text-white"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="max-h-[75vh] overflow-y-auto p-6">
+              {isComparisonLoading ? (
+                <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-slate-950/60 p-4 text-slate-300">
+                  <Loader2 className="animate-spin" size={18} />
+                  Generating two regenerated answers for comparison...
+                </div>
+              ) : comparisonVersions.length < 2 ? (
+                <p className="text-sm text-slate-400">
+                  No comparison versions generated yet.
+                </p>
+              ) : (
+                <div className="grid gap-4 lg:grid-cols-2">
+                  {comparisonVersions.map((version, index) => {
+                    const versionKey = version.id || `comparison-${index}`
+                    const isSourcesOpen = openComparisonSources[versionKey]
+
+                    return (
+                      <div
+                        key={versionKey}
+                        className="rounded-2xl border border-white/10 bg-slate-950/60 p-4"
+                      >
+                        <div className="mb-3 flex items-center justify-between gap-3">
+                          <h3 className="font-semibold text-white">
+                            Option {index + 1}
+                          </h3>
+
+                          <span className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-300">
+                            v{version.version_number || version.versionNumber || '?'}
+                          </span>
+                        </div>
+
+                        <div className="text-sm leading-relaxed text-slate-200">
+                          <ReactMarkdown>{version.content || ''}</ReactMarkdown>
+                        </div>
+
+                        {version.sources && version.sources.length > 0 && (
+                          <div className="mt-4">
+                            <button
+                              type="button"
+                              onClick={() => toggleComparisonSources(versionKey)}
+                              className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-900/70 px-3 py-1.5 text-sm text-slate-300 hover:bg-white/10"
+                            >
+                              <FileText size={15} />
+                              Sources ({version.sources.length})
+                              {isSourcesOpen ? (
+                                <ChevronDown size={15} />
+                              ) : (
+                                <ChevronRight size={15} />
+                              )}
+                            </button>
+
+                            {isSourcesOpen && (
+                              <div className="mt-3 rounded-xl border border-white/10 bg-slate-900/70 p-3">
+                                <div className="space-y-2">
+                                  {version.sources.map((source, sourceIndex) => (
+                                    <div
+                                      key={`${versionKey}-${sourceIndex}`}
+                                      className="rounded-lg border border-white/10 bg-slate-950/50 p-2 text-xs text-slate-400"
+                                    >
+                                      <p className="font-medium text-slate-200">
+                                        [{sourceIndex + 1}] {source.title || 'Unknown source'}
+                                        {source.page ? ` · Page ${source.page}` : ''}
+                                      </p>
+
+                                      <p className="mt-1 line-clamp-3">
+                                        {source.snippet || 'No snippet available.'}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1039,7 +1649,7 @@ function App() {
                       </p>
                     ) : (
                       <div className="space-y-3">
-                        {feedbackLogs.slice(-8).reverse().map((item, index) => (
+                        {feedbackLogs.slice(0, 8).map((item, index) => (
                           <div
                             key={`${item.timestamp || item.created_at || index}`}
                             className="rounded-xl border border-white/10 bg-slate-900/80 p-3"
@@ -1064,6 +1674,12 @@ function App() {
                             <p className="line-clamp-2 text-sm text-slate-300">
                               {item.question || 'No question available'}
                             </p>
+
+                            {item.reason && (
+                              <p className="mt-2 text-xs text-red-300">
+                                Reason: {item.reason}
+                              </p>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -1111,6 +1727,34 @@ function App() {
             >
               <BarChart3 size={18} />
               Feedback Dashboard
+            </button>
+
+            <button
+              type="button"
+              onClick={exportConversationAsMarkdown}
+              className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-3 font-semibold text-slate-200 hover:bg-white/10"
+            >
+              <Download size={18} />
+              Export Markdown
+            </button>
+
+            <button
+              type="button"
+              onClick={exportConversationAsPdf}
+              className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-3 font-semibold text-slate-200 hover:bg-white/10"
+            >
+              <FileText size={18} />
+              Export PDF
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowClearAllModal(true)}
+              disabled={isLoading || isClearingHistory || conversations.length === 0}
+              className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-red-400/20 bg-red-500/10 px-4 py-3 font-semibold text-red-200 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Trash2 size={18} />
+              Clear All History
             </button>
 
             <div className={`mt-5 rounded-xl ${getTourHighlightClass('history')}`}>
@@ -1242,14 +1886,34 @@ function App() {
                 )}
               </div>
 
-              <button
-                type="button"
-                onClick={openFeedbackPanel}
-                className="hidden items-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10 md:flex"
-              >
-                <BarChart3 size={16} />
-                Feedback
-              </button>
+              <div className="hidden items-center gap-2 md:flex">
+                <button
+                  type="button"
+                  onClick={exportConversationAsMarkdown}
+                  className="flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10"
+                >
+                  <Download size={16} />
+                  Export MD
+                </button>
+
+                <button
+                  type="button"
+                  onClick={exportConversationAsPdf}
+                  className="flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10"
+                >
+                  <FileText size={16} />
+                  Export PDF
+                </button>
+
+                <button
+                  type="button"
+                  onClick={openFeedbackPanel}
+                  className="flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10"
+                >
+                  <BarChart3 size={16} />
+                  Feedback
+                </button>
+              </div>
             </div>
           </header>
 
@@ -1293,6 +1957,9 @@ function App() {
               {messages.map((message) => {
                 const isUser = message.role === 'user'
                 const isSourcePanelOpen = openSourcePanels[message.id]
+                const backendMessageId = getBackendMessageId(message)
+                const versions = backendMessageId ? versionCache[backendMessageId] || [] : []
+                const currentVersionNumber = getMessageVersionNumber(message)
 
                 return (
                   <div
@@ -1313,6 +1980,12 @@ function App() {
                       >
                         {isUser ? 'You' : 'Assistant'}
                       </p>
+
+                      {!isUser && currentVersionNumber && (
+                        <p className="mt-1 text-xs text-slate-400">
+                          Current version: v{currentVersionNumber}
+                        </p>
+                      )}
 
                       <div
                         className={`mt-2 leading-relaxed ${
@@ -1343,6 +2016,50 @@ function App() {
                                 </ol>
                               ),
                               li: ({ children }) => <li>{children}</li>,
+                              a: ({ href, children }) => {
+                                if (href && href.startsWith('citation:')) {
+                                  const citationNumber = Number(
+                                    href.replace('citation:', ''),
+                                  )
+                                  const sourceIndex = citationNumber - 1
+                                  const source = message.sources?.[sourceIndex]
+
+                                  return (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        openCitationSource(message.id, sourceIndex)
+                                      }
+                                      className="group relative mx-0.5 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 text-xs font-bold text-emerald-300 hover:bg-emerald-400/20"
+                                    >
+                                      {children}
+
+                                      {source && (
+                                        <span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 hidden w-72 -translate-x-1/2 rounded-xl border border-white/10 bg-slate-950 p-3 text-left text-xs font-normal text-slate-300 shadow-2xl group-hover:block">
+                                          <span className="mb-1 block font-semibold text-white">
+                                            {source.title || 'Source'}
+                                            {source.page ? ` · Page ${source.page}` : ''}
+                                          </span>
+                                          <span className="line-clamp-5">
+                                            {source.snippet || 'No snippet available.'}
+                                          </span>
+                                        </span>
+                                      )}
+                                    </button>
+                                  )
+                                }
+
+                                return (
+                                  <a
+                                    href={href}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-emerald-300 underline"
+                                  >
+                                    {children}
+                                  </a>
+                                )
+                              },
                               code: ({ children }) => (
                                 <code className="rounded bg-slate-950 px-1 py-0.5 text-sm text-emerald-300">
                                   {children}
@@ -1353,49 +2070,9 @@ function App() {
                                   {children}
                                 </pre>
                               ),
-                              a: ({ href, children }) => {
-                                const citationMatch = href?.match(/^#source-(.*)-(\d+)$/)
-
-                                if (citationMatch) {
-                                  const sourceIndex = Number(citationMatch[2])
-                                  const source = message.sources?.[sourceIndex]
-                                  const sourceKey = `${message.id}-${sourceIndex}`
-
-                                  return (
-                                    <button
-                                      type="button"
-                                      title={source?.snippet || 'Open source'}
-                                      onClick={() => {
-                                        setOpenSourcePanels((prev) => ({
-                                          ...prev,
-                                          [message.id]: true,
-                                        }))
-                                        setOpenSources((prev) => ({
-                                          ...prev,
-                                          [sourceKey]: true,
-                                        }))
-                                      }}
-                                      className="mx-0.5 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 text-xs font-bold text-emerald-200 underline decoration-emerald-300/60 underline-offset-2 hover:bg-emerald-400/20"
-                                    >
-                                      [{children}]
-                                    </button>
-                                  )
-                                }
-
-                                return (
-                                  <a
-                                    href={href}
-                                    className="text-emerald-300 underline underline-offset-2"
-                                    target="_blank"
-                                    rel="noreferrer"
-                                  >
-                                    {children}
-                                  </a>
-                                )
-                              },
                             }}
                           >
-                            {addInlineCitationLinks(message.content, message.sources, message.id)}
+                            {normalizeCitationMarkdown(message.content)}
                           </ReactMarkdown>
                         ) : (
                           <div className="flex items-center gap-2 text-slate-400">
@@ -1404,39 +2081,6 @@ function App() {
                           </div>
                         )}
                       </div>
-
-                      {!isUser && message.dbMessageId && message.content && (
-                        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-                          <span className="rounded-full border border-white/10 bg-slate-900/70 px-2 py-1">
-                            Version {message.version_number || 1}
-                          </span>
-
-                          <button
-                            type="button"
-                            onClick={() => loadMessageVersions(message)}
-                            className="rounded-full border border-white/10 px-2 py-1 hover:bg-white/10"
-                          >
-                            Load versions
-                          </button>
-
-                          {Array.isArray(message.versions) &&
-                            message.versions.length > 1 &&
-                            message.versions.map((version) => (
-                              <button
-                                key={version.id}
-                                type="button"
-                                onClick={() => switchToVersion(message.id, version)}
-                                className={`rounded-full border px-2 py-1 ${
-                                  message.version_id === version.id
-                                    ? 'border-emerald-400 bg-emerald-400/10 text-emerald-200'
-                                    : 'border-white/10 text-slate-300 hover:bg-white/10'
-                                }`}
-                              >
-                                v{version.version_number}
-                              </button>
-                            ))}
-                        </div>
-                      )}
 
                       {!isUser && message.sources && message.sources.length > 0 && (
                         <div className="mt-4">
@@ -1472,7 +2116,7 @@ function App() {
                                         className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
                                       >
                                         <span className="font-medium">
-                                          {source.title}
+                                          [{index + 1}] {source.title}
                                           {source.page ? ` · Page ${source.page}` : ''}
                                         </span>
 
@@ -1511,50 +2155,104 @@ function App() {
                       )}
 
                       {!isUser && (
-                        <div
-                          className={`mt-4 flex flex-wrap items-center gap-2 ${getTourHighlightClass(
-                            'sources-feedback',
-                          )}`}
-                        >
-                          <button
-                            onClick={() => sendFeedback(message, 'thumbs_up')}
-                            disabled={isLoading && !message.content}
-                            className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
-                              message.feedbackStatus === 'thumbs_up'
-                                ? 'border-emerald-400 bg-emerald-400/20 text-emerald-200'
-                                : 'border-white/10 text-slate-300 hover:bg-white/10'
-                            } disabled:cursor-not-allowed disabled:opacity-50`}
+                        <div className="mt-4">
+                          <div
+                            className={`flex flex-wrap items-center gap-2 ${getTourHighlightClass(
+                              'sources-feedback',
+                            )}`}
                           >
-                            <ThumbsUp size={15} />
-                            Helpful
-                          </button>
+                            <button
+                              onClick={() => sendFeedback(message, 'thumbs_up')}
+                              disabled={isLoading && !message.content}
+                              className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
+                                message.feedbackStatus === 'thumbs_up'
+                                  ? 'border-emerald-400 bg-emerald-400/20 text-emerald-200'
+                                  : 'border-white/10 text-slate-300 hover:bg-white/10'
+                              } disabled:cursor-not-allowed disabled:opacity-50`}
+                            >
+                              <ThumbsUp size={15} />
+                              Helpful
+                            </button>
 
-                          <button
-                            onClick={() => openNegativeFeedbackModal(message)}
-                            disabled={isLoading && !message.content}
-                            className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
-                              message.feedbackStatus === 'thumbs_down'
-                                ? 'border-red-400 bg-red-400/20 text-red-200'
-                                : 'border-white/10 text-slate-300 hover:bg-white/10'
-                            } disabled:cursor-not-allowed disabled:opacity-50`}
-                          >
-                            <ThumbsDown size={15} />
-                            Needs work
-                          </button>
+                            <button
+                              onClick={() => openNegativeFeedbackModal(message)}
+                              disabled={isLoading && !message.content}
+                              className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
+                                message.feedbackStatus === 'thumbs_down'
+                                  ? 'border-red-400 bg-red-400/20 text-red-200'
+                                  : 'border-white/10 text-slate-300 hover:bg-white/10'
+                              } disabled:cursor-not-allowed disabled:opacity-50`}
+                            >
+                              <ThumbsDown size={15} />
+                              Needs work
+                            </button>
 
-                          <button
-                            onClick={() => regenerateAnswer(message)}
-                            disabled={isLoading || !message.content}
-                            className="flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-sm text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            <RotateCcw size={15} />
-                            Regenerate
-                          </button>
+                            <button
+                              onClick={() => regenerateAnswer(message)}
+                              disabled={isLoading || !message.content}
+                              className="flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-sm text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              <RotateCcw size={15} />
+                              Regenerate
+                            </button>
 
-                          {message.feedbackStatus && (
-                            <span className="ml-2 text-xs text-slate-400">
-                              Feedback saved
-                            </span>
+                            <button
+                              onClick={() => generateComparison(message)}
+                              disabled={isLoading || isComparisonLoading || !message.content}
+                              className="flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-sm text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              <Columns3 size={15} />
+                              Compare
+                            </button>
+
+                            {backendMessageId && (
+                              <button
+                                onClick={() => loadVersions(message)}
+                                disabled={loadingVersionsFor === message.id}
+                                className="flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-sm text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {loadingVersionsFor === message.id ? (
+                                  <Loader2 size={15} className="animate-spin" />
+                                ) : (
+                                  <ChevronDown size={15} />
+                                )}
+                                Load versions
+                              </button>
+                            )}
+
+                            {message.feedbackStatus && (
+                              <span className="ml-2 text-xs text-slate-400">
+                                Feedback saved
+                              </span>
+                            )}
+                          </div>
+
+                          {versions.length > 0 && (
+                            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 p-2">
+                              <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                Versions
+                              </span>
+
+                              {versions.map((version) => {
+                                const isCurrent =
+                                  currentVersionNumber === version.version_number
+
+                                return (
+                                  <button
+                                    key={version.id}
+                                    type="button"
+                                    onClick={() => selectVersion(message, version)}
+                                    className={`rounded-full border px-3 py-1 text-xs font-semibold ${
+                                      isCurrent
+                                        ? 'border-emerald-400 bg-emerald-400/20 text-emerald-200'
+                                        : 'border-white/10 text-slate-300 hover:bg-white/10'
+                                    }`}
+                                  >
+                                    v{version.version_number}
+                                  </button>
+                                )
+                              })}
+                            </div>
                           )}
                         </div>
                       )}

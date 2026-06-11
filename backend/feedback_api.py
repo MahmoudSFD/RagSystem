@@ -45,7 +45,7 @@ LOCAL_FEEDBACK_FILE = Path("feedback_logs.jsonl")
 
 DATABASE_URL = "mysql+pymysql://root:rootpassword@127.0.0.1:3307/rag_app"
 
-OLLAMA_MODEL = "qwen2.5:7b"
+OLLAMA_MODEL = "qwen2.5:3b"
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
 engine = create_engine(
