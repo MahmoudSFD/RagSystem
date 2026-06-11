@@ -26,6 +26,16 @@ const FEEDBACK_API_URL = 'http://127.0.0.1:8000/api/feedback'
 const FEEDBACK_SUMMARY_API_URL = 'http://127.0.0.1:8000/api/feedback/summary'
 const CHAT_STREAM_API_URL = 'http://127.0.0.1:8000/api/chat/stream'
 const CONVERSATIONS_API_URL = 'http://127.0.0.1:8000/api/conversations'
+const MESSAGE_API_BASE_URL = 'http://127.0.0.1:8000/api/messages'
+
+const NEGATIVE_FEEDBACK_REASONS = [
+  'Answer is incorrect',
+  'Sources do not support the answer',
+  'Missing important details',
+  'Too vague or unclear',
+  'Other',
+]
+
 
 const TITLE_OVERRIDES_KEY = 'ragConversationTitleOverrides'
 
@@ -38,6 +48,10 @@ const welcomeMessage = {
   feedbackStatus: null,
   run_id: null,
   question: null,
+  dbMessageId: null,
+  version_id: null,
+  version_number: null,
+  versions: [],
 }
 
 function App() {
@@ -53,6 +67,10 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
 
   const [deleteTarget, setDeleteTarget] = useState(null)
+
+  const [feedbackTarget, setFeedbackTarget] = useState(null)
+  const [feedbackReason, setFeedbackReason] = useState('')
+  const [feedbackComment, setFeedbackComment] = useState('')
 
   const [showFeedbackPanel, setShowFeedbackPanel] = useState(false)
   const [feedbackSummary, setFeedbackSummary] = useState(null)
@@ -135,6 +153,22 @@ function App() {
     return titleOverrides[conversation.id] || conversation.title || 'Untitled chat'
   }
 
+  function addInlineCitationLinks(content, sources, messageId) {
+    if (!content || !Array.isArray(sources) || sources.length === 0) {
+      return content
+    }
+
+    return content.replace(/\[(\d+)\](?!\()/g, (match, numberText) => {
+      const sourceIndex = Number(numberText) - 1
+
+      if (!sources[sourceIndex]) {
+        return match
+      }
+
+      return `[${numberText}](#source-${messageId}-${sourceIndex})`
+    })
+  }
+
   function saveTitleOverrides(nextOverrides) {
     setTitleOverrides(nextOverrides)
     localStorage.setItem(TITLE_OVERRIDES_KEY, JSON.stringify(nextOverrides))
@@ -178,11 +212,15 @@ function App() {
 
         return {
           id: `${data.id}-${message.id}`,
+          dbMessageId: message.id,
           role: message.role,
           content: message.content,
           sources: message.sources || [],
           feedbackStatus: null,
           run_id: message.run_id || null,
+          version_id: message.version_id || null,
+          version_number: message.version_number || null,
+          versions: [],
           question:
             message.role === 'assistant'
               ? previousUserMessage?.content || 'Loaded from history'
@@ -350,6 +388,10 @@ function App() {
       question: currentQuestion,
       feedbackStatus: null,
       isRegenerated: !appendUserMessage,
+      dbMessageId: null,
+      version_id: null,
+      version_number: null,
+      versions: [],
     })
 
     setMessages((prev) => [...prev, ...newMessages])
@@ -423,6 +465,23 @@ function App() {
                       ...message,
                       sources: data.sources || [],
                       run_id: data.run_id || null,
+                      dbMessageId: data.message_id || message.dbMessageId || null,
+                      version_id: data.version_id || message.version_id || null,
+                      version_number: data.version_number || message.version_number || null,
+                      versions:
+                        data.version_id
+                          ? [
+                              {
+                                id: data.version_id,
+                                message_id: data.message_id,
+                                version_number: data.version_number || 1,
+                                content: message.content,
+                                run_id: data.run_id || null,
+                                is_selected: true,
+                                sources: data.sources || [],
+                              },
+                            ]
+                          : message.versions || [],
                     }
                   : message,
               ),
@@ -467,17 +526,114 @@ function App() {
     await streamQuestion(input, { appendUserMessage: true })
   }
 
-  function regenerateAnswer(message) {
+  async function regenerateAnswer(message) {
     if (isLoading) return
 
-    const question = message.question
-
-    if (!question || question === 'Loaded from history') {
-      setErrorMessage('Could not regenerate this answer because the original question was not found.')
+    if (!message.dbMessageId) {
+      setErrorMessage('Could not regenerate this answer because the backend message ID was not found.')
       return
     }
 
-    streamQuestion(question, { appendUserMessage: true })
+    setIsLoading(true)
+    setLoadingStage('Regenerating answer...')
+    setErrorMessage('')
+
+    try {
+      const response = await fetch(`${MESSAGE_API_BASE_URL}/${message.dbMessageId}/regenerate`, {
+        method: 'POST',
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to regenerate answer')
+      }
+
+      const data = await response.json()
+      const version = data.version
+
+      setMessages((currentMessages) =>
+        currentMessages.map((currentMessage) => {
+          if (currentMessage.id !== message.id) {
+            return currentMessage
+          }
+
+          const existingVersions = currentMessage.versions || []
+          const withoutDuplicate = existingVersions.filter(
+            (item) => item.id !== version.id,
+          )
+
+          return {
+            ...currentMessage,
+            content: data.answer || version.content,
+            sources: data.sources || version.sources || [],
+            run_id: data.run_id || version.run_id || null,
+            version_id: data.version_id || version.id,
+            version_number: data.version_number || version.version_number,
+            versions: [...withoutDuplicate, version].sort(
+              (a, b) => a.version_number - b.version_number,
+            ),
+            feedbackStatus: null,
+          }
+        }),
+      )
+
+      await loadConversations()
+    } catch (error) {
+      console.error(error)
+      setErrorMessage('Could not regenerate this answer from the backend.')
+    } finally {
+      setIsLoading(false)
+      setLoadingStage('')
+    }
+  }
+
+  async function loadMessageVersions(message) {
+    if (!message.dbMessageId) {
+      setErrorMessage('Could not load versions because the backend message ID was not found.')
+      return
+    }
+
+    try {
+      setErrorMessage('')
+
+      const response = await fetch(`${MESSAGE_API_BASE_URL}/${message.dbMessageId}/versions`)
+
+      if (!response.ok) {
+        throw new Error('Failed to load message versions')
+      }
+
+      const data = await response.json()
+
+      setMessages((currentMessages) =>
+        currentMessages.map((currentMessage) =>
+          currentMessage.id === message.id
+            ? {
+                ...currentMessage,
+                versions: data.versions || [],
+              }
+            : currentMessage,
+        ),
+      )
+    } catch (error) {
+      console.error(error)
+      setErrorMessage('Could not load answer versions.')
+    }
+  }
+
+  function switchToVersion(messageId, version) {
+    setMessages((currentMessages) =>
+      currentMessages.map((message) =>
+        message.id === messageId
+          ? {
+              ...message,
+              content: version.content,
+              sources: version.sources || [],
+              run_id: version.run_id || null,
+              version_id: version.id,
+              version_number: version.version_number,
+            }
+          : message,
+      ),
+    )
   }
 
   function handleKeyDown(event) {
@@ -503,7 +659,7 @@ function App() {
     }))
   }
 
-  async function sendFeedback(message, feedbackType) {
+  async function sendFeedback(message, feedbackType, reason = null, commentText = null) {
     setErrorMessage('')
 
     try {
@@ -516,16 +672,22 @@ function App() {
           question: message.question || 'Unknown question',
           answer: message.content,
           feedback: feedbackType,
+          reason,
+          conversation_id: activeConversationId,
+          message_id: message.dbMessageId || null,
+          version_id: message.version_id || null,
           comment:
-            feedbackType === 'thumbs_up'
+            commentText ||
+            (feedbackType === 'thumbs_up'
               ? 'User marked the answer as helpful.'
-              : 'User marked the answer as needing work.',
+              : `User marked the answer as needing work. Reason: ${reason}`),
           run_id: message.run_id || null,
         }),
       })
 
       if (!response.ok) {
-        throw new Error('Feedback request failed')
+        const errorData = await response.json().catch(() => null)
+        throw new Error(errorData?.detail || 'Feedback request failed')
       }
 
       setMessages((currentMessages) =>
@@ -540,12 +702,42 @@ function App() {
           return currentMessage
         }),
       )
+
+      await loadFeedbackData()
     } catch (error) {
       console.error(error)
       setErrorMessage(
-        'Could not send feedback. Make sure the FastAPI backend is running.',
+        error.message || 'Could not send feedback. Make sure the FastAPI backend is running.',
       )
     }
+  }
+
+  function openNegativeFeedbackModal(message) {
+    if (!message.content || isLoading) return
+
+    setFeedbackTarget(message)
+    setFeedbackReason('')
+    setFeedbackComment('')
+  }
+
+  async function submitNegativeFeedback() {
+    if (!feedbackTarget) return
+
+    if (!feedbackReason) {
+      setErrorMessage('Please select a reason before submitting negative feedback.')
+      return
+    }
+
+    await sendFeedback(
+      feedbackTarget,
+      'thumbs_down',
+      feedbackReason,
+      feedbackComment.trim() || null,
+    )
+
+    setFeedbackTarget(null)
+    setFeedbackReason('')
+    setFeedbackComment('')
   }
 
   function handleNextTourStep() {
@@ -682,6 +874,78 @@ function App() {
                 className="rounded-xl bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-400"
               >
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {feedbackTarget && (
+        <div className="fixed inset-0 z-[115] flex items-center justify-center bg-slate-950/80 px-4">
+          <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold uppercase tracking-wide text-red-300">
+                  Needs work
+                </p>
+                <h2 className="mt-1 text-xl font-bold text-white">
+                  Why was this answer not good enough?
+                </h2>
+                <p className="mt-2 text-sm text-slate-400">
+                  A reason is required for negative feedback so the team can review answer quality later.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setFeedbackTarget(null)}
+                className="rounded-xl border border-white/10 p-2 text-slate-400 hover:bg-white/10 hover:text-white"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="mt-5 space-y-2">
+              {NEGATIVE_FEEDBACK_REASONS.map((reason) => (
+                <button
+                  key={reason}
+                  type="button"
+                  onClick={() => setFeedbackReason(reason)}
+                  className={`flex w-full items-center justify-between rounded-xl border px-4 py-3 text-left text-sm transition ${
+                    feedbackReason === reason
+                      ? 'border-red-400 bg-red-400/10 text-red-200'
+                      : 'border-white/10 bg-slate-950/50 text-slate-300 hover:bg-white/10'
+                  }`}
+                >
+                  <span>{reason}</span>
+                  {feedbackReason === reason && <Check size={16} />}
+                </button>
+              ))}
+            </div>
+
+            <textarea
+              value={feedbackComment}
+              onChange={(event) => setFeedbackComment(event.target.value)}
+              className="mt-4 min-h-24 w-full rounded-xl border border-white/10 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-red-400"
+              placeholder="Optional comment..."
+            />
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setFeedbackTarget(null)}
+                className="rounded-xl border border-white/10 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-white/10"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                onClick={submitNegativeFeedback}
+                disabled={!feedbackReason}
+                className="rounded-xl bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Submit feedback
               </button>
             </div>
           </div>
@@ -1089,9 +1353,49 @@ function App() {
                                   {children}
                                 </pre>
                               ),
+                              a: ({ href, children }) => {
+                                const citationMatch = href?.match(/^#source-(.*)-(\d+)$/)
+
+                                if (citationMatch) {
+                                  const sourceIndex = Number(citationMatch[2])
+                                  const source = message.sources?.[sourceIndex]
+                                  const sourceKey = `${message.id}-${sourceIndex}`
+
+                                  return (
+                                    <button
+                                      type="button"
+                                      title={source?.snippet || 'Open source'}
+                                      onClick={() => {
+                                        setOpenSourcePanels((prev) => ({
+                                          ...prev,
+                                          [message.id]: true,
+                                        }))
+                                        setOpenSources((prev) => ({
+                                          ...prev,
+                                          [sourceKey]: true,
+                                        }))
+                                      }}
+                                      className="mx-0.5 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 text-xs font-bold text-emerald-200 underline decoration-emerald-300/60 underline-offset-2 hover:bg-emerald-400/20"
+                                    >
+                                      [{children}]
+                                    </button>
+                                  )
+                                }
+
+                                return (
+                                  <a
+                                    href={href}
+                                    className="text-emerald-300 underline underline-offset-2"
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    {children}
+                                  </a>
+                                )
+                              },
                             }}
                           >
-                            {message.content}
+                            {addInlineCitationLinks(message.content, message.sources, message.id)}
                           </ReactMarkdown>
                         ) : (
                           <div className="flex items-center gap-2 text-slate-400">
@@ -1100,6 +1404,39 @@ function App() {
                           </div>
                         )}
                       </div>
+
+                      {!isUser && message.dbMessageId && message.content && (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                          <span className="rounded-full border border-white/10 bg-slate-900/70 px-2 py-1">
+                            Version {message.version_number || 1}
+                          </span>
+
+                          <button
+                            type="button"
+                            onClick={() => loadMessageVersions(message)}
+                            className="rounded-full border border-white/10 px-2 py-1 hover:bg-white/10"
+                          >
+                            Load versions
+                          </button>
+
+                          {Array.isArray(message.versions) &&
+                            message.versions.length > 1 &&
+                            message.versions.map((version) => (
+                              <button
+                                key={version.id}
+                                type="button"
+                                onClick={() => switchToVersion(message.id, version)}
+                                className={`rounded-full border px-2 py-1 ${
+                                  message.version_id === version.id
+                                    ? 'border-emerald-400 bg-emerald-400/10 text-emerald-200'
+                                    : 'border-white/10 text-slate-300 hover:bg-white/10'
+                                }`}
+                              >
+                                v{version.version_number}
+                              </button>
+                            ))}
+                        </div>
+                      )}
 
                       {!isUser && message.sources && message.sources.length > 0 && (
                         <div className="mt-4">
@@ -1193,7 +1530,7 @@ function App() {
                           </button>
 
                           <button
-                            onClick={() => sendFeedback(message, 'thumbs_down')}
+                            onClick={() => openNegativeFeedbackModal(message)}
                             disabled={isLoading && !message.content}
                             className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm transition ${
                               message.feedbackStatus === 'thumbs_down'

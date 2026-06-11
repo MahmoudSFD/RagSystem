@@ -116,6 +116,68 @@ def init_database():
             )
         )
 
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS message_versions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    message_id INT NOT NULL,
+                    version_number INT NOT NULL,
+                    content TEXT NOT NULL,
+                    run_id VARCHAR(255) NULL,
+                    is_selected BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY (message_id) REFERENCES messages(id)
+                        ON DELETE CASCADE,
+                    UNIQUE KEY unique_message_version (message_id, version_number)
+                )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS message_version_sources (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    version_id INT NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    page INT NULL,
+                    snippet TEXT NULL,
+                    FOREIGN KEY (version_id) REFERENCES message_versions(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS feedback_entries (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    conversation_id INT NULL,
+                    message_id INT NULL,
+                    version_id INT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    feedback VARCHAR(20) NOT NULL,
+                    score INT NOT NULL,
+                    reason VARCHAR(255) NULL,
+                    comment TEXT NULL,
+                    run_id VARCHAR(255) NULL,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (message_id) REFERENCES messages(id)
+                        ON DELETE SET NULL,
+                    FOREIGN KEY (version_id) REFERENCES message_versions(id)
+                        ON DELETE SET NULL
+                )
+                """
+            )
+        )
+
 
 init_database()
 
@@ -135,6 +197,10 @@ class FeedbackRequest(BaseModel):
     answer: str = Field(..., min_length=1)
     feedback: Literal["thumbs_up", "thumbs_down"]
     comment: Optional[str] = None
+    reason: Optional[str] = None
+    conversation_id: Optional[int] = None
+    message_id: Optional[int] = None
+    version_id: Optional[int] = None
     run_id: Optional[UUID] = None
 
 
@@ -161,6 +227,10 @@ class ChatResponse(BaseModel):
 
 
 class ConversationCreateRequest(BaseModel):
+    title: str
+
+
+class ConversationRenameRequest(BaseModel):
     title: str
 
 
@@ -211,6 +281,11 @@ def health_check():
 
 @app.post("/api/conversations")
 def create_conversation(payload: ConversationCreateRequest):
+    title = payload.title.strip()
+
+    if not title:
+        title = "New chat"
+
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     with SessionLocal() as session:
@@ -222,7 +297,7 @@ def create_conversation(payload: ConversationCreateRequest):
                 """
             ),
             {
-                "title": payload.title,
+                "title": title,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -233,7 +308,7 @@ def create_conversation(payload: ConversationCreateRequest):
 
     return {
         "id": conversation_id,
-        "title": payload.title,
+        "title": title,
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
     }
@@ -288,7 +363,7 @@ def get_conversation(conversation_id: int):
                 SELECT id, role, content, created_at
                 FROM messages
                 WHERE conversation_id = :conversation_id
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 """
             ),
             {"conversation_id": conversation_id},
@@ -309,22 +384,43 @@ def get_conversation(conversation_id: int):
                 {"message_id": message["id"]},
             ).mappings().all()
 
-            message_items.append(
-                {
-                    "id": message["id"],
-                    "role": message["role"],
-                    "content": message["content"],
-                    "created_at": message["created_at"].isoformat(),
-                    "sources": [
-                        {
-                            "title": source["title"],
-                            "page": source["page"],
-                            "snippet": source["snippet"],
-                        }
-                        for source in source_rows
-                    ],
-                }
-            )
+            selected_version = None
+
+            if message["role"] == "assistant":
+                selected_version = session.execute(
+                    text(
+                        """
+                        SELECT id, version_number, run_id, is_selected
+                        FROM message_versions
+                        WHERE message_id = :message_id AND is_selected = TRUE
+                        ORDER BY version_number DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"message_id": message["id"]},
+                ).mappings().first()
+
+            item = {
+                "id": message["id"],
+                "role": message["role"],
+                "content": message["content"],
+                "created_at": message["created_at"].isoformat(),
+                "sources": [
+                    {
+                        "title": source["title"],
+                        "page": source["page"],
+                        "snippet": source["snippet"],
+                    }
+                    for source in source_rows
+                ],
+            }
+
+            if selected_version:
+                item["version_id"] = selected_version["id"]
+                item["version_number"] = selected_version["version_number"]
+                item["run_id"] = selected_version["run_id"]
+
+            message_items.append(item)
 
     return {
         "id": conversation["id"],
@@ -332,6 +428,55 @@ def get_conversation(conversation_id: int):
         "created_at": conversation["created_at"].isoformat(),
         "updated_at": conversation["updated_at"].isoformat(),
         "messages": message_items,
+    }
+
+
+@app.patch("/api/conversations/{conversation_id}")
+def rename_conversation(conversation_id: int, payload: ConversationRenameRequest):
+    title = payload.title.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with SessionLocal() as session:
+        conversation = session.execute(
+            text(
+                """
+                SELECT id
+                FROM conversations
+                WHERE id = :conversation_id
+                """
+            ),
+            {"conversation_id": conversation_id},
+        ).mappings().first()
+
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        session.execute(
+            text(
+                """
+                UPDATE conversations
+                SET title = :title, updated_at = :updated_at
+                WHERE id = :conversation_id
+                """
+            ),
+            {
+                "title": title,
+                "updated_at": now,
+                "conversation_id": conversation_id,
+            },
+        )
+
+        session.commit()
+
+    return {
+        "status": "success",
+        "conversation_id": conversation_id,
+        "title": title,
+        "updated_at": now.isoformat(),
     }
 
 
@@ -541,6 +686,289 @@ def save_chat_message(
         return message_id
 
 
+def replace_message_content_and_sources(
+    message_id: int,
+    content: str,
+    sources: Optional[list[dict]] = None,
+) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with SessionLocal() as session:
+        message = session.execute(
+            text(
+                """
+                SELECT id, conversation_id
+                FROM messages
+                WHERE id = :message_id
+                """
+            ),
+            {"message_id": message_id},
+        ).mappings().first()
+
+        if message is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        session.execute(
+            text(
+                """
+                UPDATE messages
+                SET content = :content
+                WHERE id = :message_id
+                """
+            ),
+            {
+                "content": content,
+                "message_id": message_id,
+            },
+        )
+
+        session.execute(
+            text(
+                """
+                DELETE FROM message_sources
+                WHERE message_id = :message_id
+                """
+            ),
+            {"message_id": message_id},
+        )
+
+        if sources:
+            for source in sources:
+                session.execute(
+                    text(
+                        """
+                        INSERT INTO message_sources (message_id, title, page, snippet)
+                        VALUES (:message_id, :title, :page, :snippet)
+                        """
+                    ),
+                    {
+                        "message_id": message_id,
+                        "title": source.get("title", "Unknown source"),
+                        "page": source.get("page"),
+                        "snippet": source.get("snippet", ""),
+                    },
+                )
+
+        session.execute(
+            text(
+                """
+                UPDATE conversations
+                SET updated_at = :updated_at
+                WHERE id = :conversation_id
+                """
+            ),
+            {
+                "updated_at": now,
+                "conversation_id": message["conversation_id"],
+            },
+        )
+
+        session.commit()
+
+
+def save_message_version(
+    message_id: int,
+    content: str,
+    sources: Optional[list[dict]] = None,
+    run_id: Optional[str] = None,
+    is_selected: bool = True,
+) -> int:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    with SessionLocal() as session:
+        latest_version = session.execute(
+            text(
+                """
+                SELECT COALESCE(MAX(version_number), 0) AS latest_version
+                FROM message_versions
+                WHERE message_id = :message_id
+                """
+            ),
+            {"message_id": message_id},
+        ).mappings().first()
+
+        next_version_number = latest_version["latest_version"] + 1
+
+        if is_selected:
+            session.execute(
+                text(
+                    """
+                    UPDATE message_versions
+                    SET is_selected = FALSE
+                    WHERE message_id = :message_id
+                    """
+                ),
+                {"message_id": message_id},
+            )
+
+        result = session.execute(
+            text(
+                """
+                INSERT INTO message_versions (
+                    message_id,
+                    version_number,
+                    content,
+                    run_id,
+                    is_selected,
+                    created_at
+                )
+                VALUES (
+                    :message_id,
+                    :version_number,
+                    :content,
+                    :run_id,
+                    :is_selected,
+                    :created_at
+                )
+                """
+            ),
+            {
+                "message_id": message_id,
+                "version_number": next_version_number,
+                "content": content,
+                "run_id": run_id,
+                "is_selected": is_selected,
+                "created_at": now,
+            },
+        )
+
+        version_id = result.lastrowid
+
+        if sources:
+            for source in sources:
+                session.execute(
+                    text(
+                        """
+                        INSERT INTO message_version_sources (
+                            version_id,
+                            title,
+                            page,
+                            snippet
+                        )
+                        VALUES (
+                            :version_id,
+                            :title,
+                            :page,
+                            :snippet
+                        )
+                        """
+                    ),
+                    {
+                        "version_id": version_id,
+                        "title": source.get("title", "Unknown source"),
+                        "page": source.get("page"),
+                        "snippet": source.get("snippet", ""),
+                    },
+                )
+
+        session.commit()
+        return version_id
+
+
+def get_message_versions(message_id: int) -> list[dict]:
+    with SessionLocal() as session:
+        version_rows = session.execute(
+            text(
+                """
+                SELECT id, message_id, version_number, content, run_id, is_selected, created_at
+                FROM message_versions
+                WHERE message_id = :message_id
+                ORDER BY version_number ASC
+                """
+            ),
+            {"message_id": message_id},
+        ).mappings().all()
+
+        versions = []
+
+        for version in version_rows:
+            source_rows = session.execute(
+                text(
+                    """
+                    SELECT title, page, snippet
+                    FROM message_version_sources
+                    WHERE version_id = :version_id
+                    ORDER BY id ASC
+                    """
+                ),
+                {"version_id": version["id"]},
+            ).mappings().all()
+
+            versions.append(
+                {
+                    "id": version["id"],
+                    "message_id": version["message_id"],
+                    "version_number": version["version_number"],
+                    "content": version["content"],
+                    "run_id": version["run_id"],
+                    "is_selected": bool(version["is_selected"]),
+                    "created_at": version["created_at"].isoformat(),
+                    "sources": [
+                        {
+                            "title": source["title"],
+                            "page": source["page"],
+                            "snippet": source["snippet"],
+                        }
+                        for source in source_rows
+                    ],
+                }
+            )
+
+        return versions
+
+
+def get_previous_user_question_for_assistant(message_id: int) -> dict:
+    with SessionLocal() as session:
+        assistant_message = session.execute(
+            text(
+                """
+                SELECT id, conversation_id, role, created_at
+                FROM messages
+                WHERE id = :message_id
+                """
+            ),
+            {"message_id": message_id},
+        ).mappings().first()
+
+        if assistant_message is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        if assistant_message["role"] != "assistant":
+            raise HTTPException(
+                status_code=400,
+                detail="Only assistant messages can be regenerated",
+            )
+
+        user_message = session.execute(
+            text(
+                """
+                SELECT id, content
+                FROM messages
+                WHERE conversation_id = :conversation_id
+                  AND role = 'user'
+                  AND id < :assistant_message_id
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "conversation_id": assistant_message["conversation_id"],
+                "assistant_message_id": message_id,
+            },
+        ).mappings().first()
+
+        if user_message is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not find the original user question for this answer",
+            )
+
+        return {
+            "conversation_id": assistant_message["conversation_id"],
+            "question": user_message["content"],
+        }
+
+
 # -----------------------------
 # RAG logic
 # -----------------------------
@@ -628,7 +1056,8 @@ Rules:
 - If the context does not contain enough information, say that the document context does not provide enough information.
 - Keep the answer clear and concise.
 - Use markdown formatting.
-- Cite sources using [Source 1], [Source 2], etc.
+- Cite sources using [1], [2], [3], etc. inside the answer.
+- The citation [1] corresponds to Source 1, [2] corresponds to Source 2, and so on.
 
 Context:
 {context}
@@ -719,11 +1148,19 @@ def chat(request: ChatRequest):
 
     result = generate_rag_answer(question)
 
-    save_chat_message(
+    assistant_message_id = save_chat_message(
         conversation_id=conversation_id,
         role="assistant",
         content=result["answer"],
         sources=result["sources"],
+    )
+
+    version_id = save_message_version(
+        message_id=assistant_message_id,
+        content=result["answer"],
+        sources=result["sources"],
+        run_id=None,
+        is_selected=True,
     )
 
     return {
@@ -731,6 +1168,9 @@ def chat(request: ChatRequest):
         "sources": result["sources"],
         "run_id": None,
         "conversation_id": conversation_id,
+        "message_id": assistant_message_id,
+        "version_id": version_id,
+        "version_number": 1,
     }
 
 
@@ -756,11 +1196,19 @@ async def chat_stream(request: ChatRequest):
     answer = result["answer"]
     sources = result["sources"]
 
-    save_chat_message(
+    assistant_message_id = save_chat_message(
         conversation_id=conversation_id,
         role="assistant",
         content=answer,
         sources=sources,
+    )
+
+    version_id = save_message_version(
+        message_id=assistant_message_id,
+        content=answer,
+        sources=sources,
+        run_id=None,
+        is_selected=True,
     )
 
     async def event_generator():
@@ -780,6 +1228,9 @@ async def chat_stream(request: ChatRequest):
             "sources": sources,
             "run_id": None,
             "conversation_id": conversation_id,
+            "message_id": assistant_message_id,
+            "version_id": version_id,
+            "version_number": 1,
         }
 
         yield f"data: {json.dumps(sources_event, ensure_ascii=False)}\n\n"
@@ -796,6 +1247,72 @@ async def chat_stream(request: ChatRequest):
     )
 
 
+@app.post("/api/messages/{message_id}/regenerate")
+def regenerate_message(message_id: int):
+    original = get_previous_user_question_for_assistant(message_id)
+    question = original["question"]
+    conversation_id = original["conversation_id"]
+
+    result = generate_rag_answer(question)
+
+    version_id = save_message_version(
+        message_id=message_id,
+        content=result["answer"],
+        sources=result["sources"],
+        run_id=None,
+        is_selected=True,
+    )
+
+    replace_message_content_and_sources(
+        message_id=message_id,
+        content=result["answer"],
+        sources=result["sources"],
+    )
+
+    versions = get_message_versions(message_id)
+    current_version = next(
+        version for version in versions if version["id"] == version_id
+    )
+
+    return {
+        "status": "success",
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "version": current_version,
+        "answer": result["answer"],
+        "sources": result["sources"],
+        "run_id": None,
+        "version_id": version_id,
+        "version_number": current_version["version_number"],
+    }
+
+
+@app.get("/api/messages/{message_id}/versions")
+def list_message_versions(message_id: int):
+    with SessionLocal() as session:
+        message = session.execute(
+            text(
+                """
+                SELECT id
+                FROM messages
+                WHERE id = :message_id
+                """
+            ),
+            {"message_id": message_id},
+        ).mappings().first()
+
+        if message is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+    versions = get_message_versions(message_id)
+
+    return {
+        "message_id": message_id,
+        "count": len(versions),
+        "versions": versions,
+    }
+
+
 # -----------------------------
 # Feedback logic
 # -----------------------------
@@ -805,11 +1322,69 @@ def save_feedback_locally(feedback_record: dict) -> None:
         file.write(json.dumps(feedback_record, ensure_ascii=False) + "\n")
 
 
+def save_feedback_to_database(payload: FeedbackRequest, score: int, timestamp: datetime) -> None:
+    with SessionLocal() as session:
+        session.execute(
+            text(
+                """
+                INSERT INTO feedback_entries (
+                    conversation_id,
+                    message_id,
+                    version_id,
+                    question,
+                    answer,
+                    feedback,
+                    score,
+                    reason,
+                    comment,
+                    run_id,
+                    created_at
+                )
+                VALUES (
+                    :conversation_id,
+                    :message_id,
+                    :version_id,
+                    :question,
+                    :answer,
+                    :feedback,
+                    :score,
+                    :reason,
+                    :comment,
+                    :run_id,
+                    :created_at
+                )
+                """
+            ),
+            {
+                "conversation_id": payload.conversation_id,
+                "message_id": payload.message_id,
+                "version_id": payload.version_id,
+                "question": payload.question,
+                "answer": payload.answer,
+                "feedback": payload.feedback,
+                "score": score,
+                "reason": payload.reason,
+                "comment": payload.comment,
+                "run_id": str(payload.run_id) if payload.run_id else None,
+                "created_at": timestamp,
+            },
+        )
+
+        session.commit()
+
+
 @app.post("/api/feedback", response_model=FeedbackResponse)
 def collect_feedback(payload: FeedbackRequest):
+    if payload.feedback == "thumbs_down" and not payload.reason:
+        raise HTTPException(
+            status_code=400,
+            detail="A reason is required for negative feedback.",
+        )
+
     score = 1 if payload.feedback == "thumbs_up" else 0
     feedback_key = "user_feedback"
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    timestamp = timestamp_dt.isoformat()
 
     feedback_record = {
         "timestamp": timestamp,
@@ -817,16 +1392,21 @@ def collect_feedback(payload: FeedbackRequest):
         "answer": payload.answer,
         "feedback": payload.feedback,
         "score": score,
+        "reason": payload.reason,
         "comment": payload.comment,
+        "conversation_id": payload.conversation_id,
+        "message_id": payload.message_id,
+        "version_id": payload.version_id,
         "run_id": str(payload.run_id) if payload.run_id else None,
     }
 
     save_feedback_locally(feedback_record)
+    save_feedback_to_database(payload, score, timestamp_dt)
 
     if payload.run_id is None:
         return FeedbackResponse(
             status="success",
-            message="Feedback saved locally. No LangSmith run_id was provided, so it was not attached to LangSmith.",
+            message="Feedback saved to MySQL and locally. No LangSmith run_id was provided.",
             feedback_key=feedback_key,
             score=score,
             logged_to_langsmith=False,
@@ -839,12 +1419,12 @@ def collect_feedback(payload: FeedbackRequest):
             run_id=payload.run_id,
             key=feedback_key,
             score=score,
-            comment=payload.comment or "",
+            comment=payload.comment or payload.reason or "",
         )
 
         return FeedbackResponse(
             status="success",
-            message="Feedback recorded successfully in LangSmith and saved locally.",
+            message="Feedback recorded in LangSmith, MySQL, and local file.",
             feedback_key=feedback_key,
             score=score,
             logged_to_langsmith=True,
@@ -855,24 +1435,52 @@ def collect_feedback(payload: FeedbackRequest):
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Feedback was saved locally, but failed to log to LangSmith: {str(error)}",
+            detail=f"Feedback was saved to MySQL and locally, but failed to log to LangSmith: {str(error)}",
         )
 
 
 @app.get("/api/feedback")
 def get_feedback_logs():
-    if not LOCAL_FEEDBACK_FILE.exists():
-        return {
-            "status": "success",
-            "count": 0,
-            "feedback": [],
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    conversation_id,
+                    message_id,
+                    version_id,
+                    question,
+                    answer,
+                    feedback,
+                    score,
+                    reason,
+                    comment,
+                    run_id,
+                    created_at
+                FROM feedback_entries
+                ORDER BY created_at DESC, id DESC
+                """
+            )
+        ).mappings().all()
+
+    feedback_items = [
+        {
+            "id": row["id"],
+            "conversation_id": row["conversation_id"],
+            "message_id": row["message_id"],
+            "version_id": row["version_id"],
+            "question": row["question"],
+            "answer": row["answer"],
+            "feedback": row["feedback"],
+            "score": row["score"],
+            "reason": row["reason"],
+            "comment": row["comment"],
+            "run_id": row["run_id"],
+            "timestamp": row["created_at"].isoformat(),
         }
-
-    feedback_items = []
-
-    with LOCAL_FEEDBACK_FILE.open("r", encoding="utf-8") as file:
-        for line in file:
-            feedback_items.append(json.loads(line))
+        for row in rows
+    ]
 
     return {
         "status": "success",
@@ -883,31 +1491,26 @@ def get_feedback_logs():
 
 @app.get("/api/feedback/summary")
 def get_feedback_summary():
-    if not LOCAL_FEEDBACK_FILE.exists():
-        return {
-            "status": "success",
-            "total_feedback": 0,
-            "thumbs_up": 0,
-            "thumbs_down": 0,
-        }
+    with SessionLocal() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS total_feedback,
+                    SUM(CASE WHEN feedback = 'thumbs_up' THEN 1 ELSE 0 END) AS thumbs_up,
+                    SUM(CASE WHEN feedback = 'thumbs_down' THEN 1 ELSE 0 END) AS thumbs_down
+                FROM feedback_entries
+                """
+            )
+        ).mappings().first()
 
-    thumbs_up = 0
-    thumbs_down = 0
-    total = 0
-
-    with LOCAL_FEEDBACK_FILE.open("r", encoding="utf-8") as file:
-        for line in file:
-            item = json.loads(line)
-            total += 1
-
-            if item["feedback"] == "thumbs_up":
-                thumbs_up += 1
-            elif item["feedback"] == "thumbs_down":
-                thumbs_down += 1
+    total_feedback = int(row["total_feedback"] or 0)
+    thumbs_up = int(row["thumbs_up"] or 0)
+    thumbs_down = int(row["thumbs_down"] or 0)
 
     return {
         "status": "success",
-        "total_feedback": total,
+        "total_feedback": total_feedback,
         "thumbs_up": thumbs_up,
         "thumbs_down": thumbs_down,
     }
