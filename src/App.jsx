@@ -3,6 +3,7 @@ import {
   Send,
   ThumbsUp,
   ThumbsDown,
+  CircleHelp,
   FileText,
   ChevronDown,
   ChevronRight,
@@ -1171,7 +1172,11 @@ function App() {
 
     closeNegativeFeedbackModal()
   }
-
+  function restartGuidedTour() {
+  localStorage.removeItem('ragTourCompleted')
+  setTourStep(0)
+  setShowTour(true)
+}
   function handleNextTourStep() {
     if (tourStep < tourSteps.length - 1) {
       setTourStep((currentStep) => currentStep + 1)
@@ -1721,6 +1726,15 @@ function App() {
             </button>
 
             <button
+  type="button"
+  onClick={restartGuidedTour}
+  className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-3 font-semibold text-slate-200 hover:bg-white/10"
+>
+  <CircleHelp size={18} />
+  Guided Tour
+</button>
+
+            <button
               type="button"
               onClick={openFeedbackPanel}
               className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-4 py-3 font-semibold text-slate-200 hover:bg-white/10"
@@ -1887,6 +1901,16 @@ function App() {
               </div>
 
               <div className="hidden items-center gap-2 md:flex">
+
+              <button
+  type="button"
+  onClick={restartGuidedTour}
+  className="flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/60 px-3 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10"
+  title="Restart guided tour"
+>
+  <CircleHelp size={16} />
+</button>
+
                 <button
                   type="button"
                   onClick={exportConversationAsMarkdown}
