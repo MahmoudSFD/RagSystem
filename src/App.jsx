@@ -181,25 +181,180 @@ function App() {
   function getMessageVersionNumber(message) {
     return message.version_number || message.versionNumber || null
   }
+function normalizeCitationMarkdown(content) {
+  if (!content) return ''
 
-  function normalizeCitationMarkdown(content) {
+  // Convert plain citations like [1], [2] into internal citation links.
+  // The (?!\() avoids changing citations that are already markdown links.
+  return content.replace(/\[(\d+)\](?!\()/g, (match, number) => {
+    return `[${match}](citation:${number})`
+  })
+}
+
+ function openCitationSource(messageId, sourceIndex) {
+  setOpenSourcePanels((prev) => ({
+    ...prev,
+    [messageId]: true,
+  }))
+
+  setOpenSources((prev) => ({
+    ...prev,
+    [`${messageId}-${sourceIndex}`]: true,
+  }))
+
+  setTimeout(() => {
+    const sourceElement = document.getElementById(
+      `source-${messageId}-${sourceIndex}`,
+    )
+
+    if (sourceElement) {
+      sourceElement.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
+    }
+  }, 100)
+}
+  
+
+
+  function formatAnswerText(content) {
     if (!content) return ''
 
-    return content.replace(/\[(\d+)\]/g, (match, number) => {
-      return `[${match}](citation:${number})`
+    const cleaned = content.trim()
+
+    // If the model already returned bullets or paragraphs, keep them.
+    if (cleaned.includes('\n\n') || cleaned.includes('\n- ') || cleaned.includes('\n• ')) {
+      return cleaned
+    }
+
+    // For long plain paragraphs, add breathing room after sentence endings.
+    // This makes generated answers easier to scan without changing the actual answer.
+    if (cleaned.length > 350) {
+      return cleaned
+        .replace(/([.!?])\s+(?=[A-Z])/g, '$1\n\n')
+        .replace(/\n{3,}/g, '\n\n')
+    }
+
+    return cleaned
+  }
+
+  function renderTextWithCitationButtons(text, message, keyPrefix) {
+    const parts = text.split(/(\[\d+\])/g)
+
+    return parts.map((part, index) => {
+      const citationMatch = part.match(/^\[(\d+)\]$/)
+
+      if (citationMatch) {
+        const citationNumber = Number(citationMatch[1])
+        const sourceIndex = citationNumber - 1
+        const source = message.sources?.[sourceIndex]
+
+        return (
+          <button
+            key={`${keyPrefix}-citation-${index}`}
+            type="button"
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              openCitationSource(message.id, sourceIndex)
+            }}
+            className="group relative mx-0.5 inline-flex rounded-md border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 text-xs font-bold text-emerald-300 hover:bg-emerald-400/20"
+          >
+            {part}
+
+            {source && (
+              <span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 hidden w-72 -translate-x-1/2 rounded-xl border border-white/10 bg-slate-950 p-3 text-left text-xs font-normal text-slate-300 shadow-2xl group-hover:block">
+                <span className="mb-1 block font-semibold text-white">
+                  {source.title || 'Source'}
+                  {source.page ? ` · Page ${source.page}` : ''}
+                </span>
+                <span className="line-clamp-5">
+                  {source.snippet || 'No snippet available.'}
+                </span>
+              </span>
+            )}
+          </button>
+        )
+      }
+
+      return (
+        <ReactMarkdown
+          key={`${keyPrefix}-text-${index}`}
+          components={{
+            p: ({ children }) => <span>{children}</span>,
+            strong: ({ children }) => (
+              <strong className="font-bold text-white">{children}</strong>
+            ),
+            em: ({ children }) => <em className="italic">{children}</em>,
+            code: ({ children }) => (
+              <code className="rounded bg-slate-950 px-1 py-0.5 text-sm text-emerald-300">
+                {children}
+              </code>
+            ),
+            a: ({ children }) => (
+              <span className="text-emerald-300 underline">{children}</span>
+            ),
+          }}
+        >
+          {part}
+        </ReactMarkdown>
+      )
     })
   }
 
-  function openCitationSource(messageId, sourceIndex) {
-    setOpenSourcePanels((prev) => ({
-      ...prev,
-      [messageId]: true,
-    }))
+  function renderAnswerWithCitations(message) {
+    const formattedContent = formatAnswerText(message.content || '')
+    const blocks = formattedContent.split(/\n{2,}/).filter((block) => block.trim())
 
-    setOpenSources((prev) => ({
-      ...prev,
-      [`${messageId}-${sourceIndex}`]: true,
-    }))
+    return (
+      <div className="space-y-3 leading-8">
+        {blocks.map((block, blockIndex) => {
+          const trimmedBlock = block.trim()
+          const isBulletBlock =
+            trimmedBlock.startsWith('- ') ||
+            trimmedBlock.startsWith('• ') ||
+            /^\d+\.\s/.test(trimmedBlock)
+
+          if (isBulletBlock) {
+            const items = trimmedBlock
+              .split(/\n/)
+              .map((item) => item.replace(/^[-•]\s*/, '').replace(/^\d+\.\s*/, '').trim())
+              .filter(Boolean)
+
+            return (
+              <ul
+                key={`${message.id}-block-${blockIndex}`}
+                className="ml-5 list-disc space-y-2 text-slate-100"
+              >
+                {items.map((item, itemIndex) => (
+                  <li key={`${message.id}-block-${blockIndex}-item-${itemIndex}`}>
+                    {renderTextWithCitationButtons(
+                      item,
+                      message,
+                      `${message.id}-block-${blockIndex}-item-${itemIndex}`,
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )
+          }
+
+          return (
+            <p
+              key={`${message.id}-block-${blockIndex}`}
+              className="text-slate-100"
+            >
+              {renderTextWithCitationButtons(
+                trimmedBlock,
+                message,
+                `${message.id}-block-${blockIndex}`,
+              )}
+            </p>
+          )
+        })}
+      </div>
+    )
   }
 
   function toggleComparisonSources(versionKey) {
@@ -2019,85 +2174,7 @@ function App() {
                         {isUser ? (
                           <p>{message.content}</p>
                         ) : message.content ? (
-                          <ReactMarkdown
-                            components={{
-                              p: ({ children }) => (
-                                <p className="mb-2">{children}</p>
-                              ),
-                              strong: ({ children }) => (
-                                <strong className="font-bold text-white">
-                                  {children}
-                                </strong>
-                              ),
-                              ul: ({ children }) => (
-                                <ul className="mb-2 ml-5 list-disc space-y-1">
-                                  {children}
-                                </ul>
-                              ),
-                              ol: ({ children }) => (
-                                <ol className="mb-2 ml-5 list-decimal space-y-1">
-                                  {children}
-                                </ol>
-                              ),
-                              li: ({ children }) => <li>{children}</li>,
-                              a: ({ href, children }) => {
-                                if (href && href.startsWith('citation:')) {
-                                  const citationNumber = Number(
-                                    href.replace('citation:', ''),
-                                  )
-                                  const sourceIndex = citationNumber - 1
-                                  const source = message.sources?.[sourceIndex]
-
-                                  return (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        openCitationSource(message.id, sourceIndex)
-                                      }
-                                      className="group relative mx-0.5 rounded-md border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 text-xs font-bold text-emerald-300 hover:bg-emerald-400/20"
-                                    >
-                                      {children}
-
-                                      {source && (
-                                        <span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 hidden w-72 -translate-x-1/2 rounded-xl border border-white/10 bg-slate-950 p-3 text-left text-xs font-normal text-slate-300 shadow-2xl group-hover:block">
-                                          <span className="mb-1 block font-semibold text-white">
-                                            {source.title || 'Source'}
-                                            {source.page ? ` · Page ${source.page}` : ''}
-                                          </span>
-                                          <span className="line-clamp-5">
-                                            {source.snippet || 'No snippet available.'}
-                                          </span>
-                                        </span>
-                                      )}
-                                    </button>
-                                  )
-                                }
-
-                                return (
-                                  <a
-                                    href={href}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="text-emerald-300 underline"
-                                  >
-                                    {children}
-                                  </a>
-                                )
-                              },
-                              code: ({ children }) => (
-                                <code className="rounded bg-slate-950 px-1 py-0.5 text-sm text-emerald-300">
-                                  {children}
-                                </code>
-                              ),
-                              pre: ({ children }) => (
-                                <pre className="my-3 overflow-x-auto rounded-xl bg-slate-950 p-3 text-sm">
-                                  {children}
-                                </pre>
-                              ),
-                            }}
-                          >
-                            {normalizeCitationMarkdown(message.content)}
-                          </ReactMarkdown>
+                          renderAnswerWithCitations(message)
                         ) : (
                           <div className="flex items-center gap-2 text-slate-400">
                             <Loader2 size={16} className="animate-spin" />
@@ -2131,6 +2208,7 @@ function App() {
 
                                   return (
                                     <div
+                                      id={`source-${message.id}-${index}`}
                                       key={sourceKey}
                                       className="rounded-lg border border-white/10 bg-slate-950/50"
                                     >
