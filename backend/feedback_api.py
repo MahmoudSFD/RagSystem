@@ -1039,25 +1039,28 @@ def build_rag_prompt(question: str, chunks: list[dict]) -> str:
     context_blocks = []
 
     for index, chunk in enumerate(chunks, start=1):
+        source = chunk.get("source", "Unknown source")
+        page_number = chunk.get("page_number", "N/A")
+        text = chunk.get("text", "")
+
         context_blocks.append(
-            f"[Source {index}]\n"
-            f"Document: {chunk.get('source')}\n"
-            f"Page: {chunk.get('page_number')}\n"
-            f"Text:\n{chunk.get('text')}"
+            f"[{index}] Source: {source}\n"
+            f"Page: {page_number}\n"
+            f"Content:\n{text}"
         )
 
-    context = "\n\n".join(context_blocks)
+    context = "\n\n---\n\n".join(context_blocks)
 
     return f"""
-You are a cybersecurity assistant answering questions using the CIS Controls context below.
+You are a helpful RAG assistant. Answer the user's question using ONLY the provided context.
 
 Rules:
-- Use only the provided context.
-- If the context does not contain enough information, say that the document context does not provide enough information.
-- Keep the answer clear and concise.
-- Use markdown formatting.
-- Cite sources using [1], [2], [3], etc. inside the answer.
-- The citation [1] corresponds to Source 1, [2] corresponds to Source 2, and so on.
+1. Use the context below to answer.
+2. Every factual sentence must include a citation like [1] or [2].
+3. Use the citation number that matches the source block.
+4. Do not write a Sources section at the end.
+5. Do not invent citations.
+6. If the context does not contain enough information, say that the available sources do not provide enough information.
 
 Context:
 {context}
@@ -1065,8 +1068,8 @@ Context:
 Question:
 {question}
 
-Answer:
-""".strip()
+Answer with inline citations:
+"""
 
 
 def ask_ollama(prompt: str) -> str:
